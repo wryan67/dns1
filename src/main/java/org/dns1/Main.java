@@ -130,12 +130,21 @@ public class Main {
     private static final int MAX_TRACKED_CLIENTS = 4096;
     private static final int MAX_IP_LENGTH = 45;
 
-    /* The three policies a query can be judged under. They apply both to a
-     * single client and, as the default, to every client that has no policy of
-     * its own. */
+    /* The policies a query can be judged under. They apply both to a single
+     * client and, as the default, to every client that has no policy of its
+     * own. "whitelist" is the old "filtered" behaviour: listed whitelist names
+     * only. "games" allows the whitelist and the games list. */
     private static final String MODE_ALLOW_ALL = "allowall";
-    private static final String MODE_FILTERED  = "filtered";
+    private static final String MODE_GAMES     = "games";
+    private static final String MODE_WHITELIST = "whitelist";
     private static final String MODE_BLOCKED   = "blocked";
+
+    /* Stored by older builds. Read as whitelist so a database that has not been
+     * migrated yet keeps today's whitelist-only behaviour. Never written. */
+    private static final String MODE_FILTERED_LEGACY = "filtered";
+
+    private static final String LIST_WHITELIST = "whitelist";
+    private static final String LIST_GAMES = "games";
 
     /* Not a policy: the wire token asking that a client's own policy be cleared
      * so it follows the default again. Stored as NULL in clients.mode. */
@@ -157,17 +166,24 @@ public class Main {
     private static boolean allowLocalNames = true;
 
     private static final Set<String> whitelistCache = ConcurrentHashMap.newKeySet();
+    private static final Set<String> gamesCache = ConcurrentHashMap.newKeySet();
     private static final ConcurrentHashMap<String, CachedDnsResponse> dnsMemoryCache = new ConcurrentHashMap<>();
 
-    /* Allowed-query hits awaiting their next batched flush to the history table. */
+    /* Allowed-query hits awaiting their next batched flush to the history table.
+     * The key is the domain, a newline, and the client address, so two clients
+     * asking for the same name keep separate counters. */
     private static final ConcurrentHashMap<String, AllowedHit> pendingAllowedHits = new ConcurrentHashMap<>();
+
+    private static String historyKey(String domain, String clientIp) {
+        return domain + "\n" + (clientIp == null ? "" : clientIp);
+    }
 
     /******************************************************************************
      * AllowedHit
      *
-     * A per-domain tally. The count is drained with getAndSet(0) rather than by
-     * removing the entry, so hits recorded during a flush are carried into the
-     * next one instead of being lost.
+     * A per-domain, per-client tally. The count is drained with getAndSet(0)
+     * rather than by removing the entry, so hits recorded during a flush are
+     * carried into the next one instead of being lost.
      ******************************************************************************/
     private static final class AllowedHit {
         private final AtomicLong count = new AtomicLong();
@@ -177,8 +193,9 @@ public class Main {
     /* The policy applied to any client that has none of its own. Changing it
      * moves every such client at once, which is what makes it useful as a
      * whole-network control: "block all" is a kill switch, "allowall" suspends
-     * filtering, "filtered" is the normal running state. */
-    private static final AtomicReference<String> defaultMode = new AtomicReference<>(MODE_FILTERED);
+     * filtering, "whitelist" is whitelist names only, "games" adds the games
+     * list. The fallback is whitelist, which is what "filtered" used to do. */
+    private static final AtomicReference<String> defaultMode = new AtomicReference<>(MODE_WHITELIST);
 
     /* Client addresses that carry a policy of their own, mirrored from
      * clients.mode. Absent means the row's mode is NULL: follow the default. */
@@ -269,7 +286,7 @@ public class Main {
     public static void main(String[] args) {
         parseCliOptions(args);
         initDatabase();
-        loadWhitelistCache();
+        loadDomainCaches();
         loadControlState();
         warnIfObsoleteActionQueue();
         installReloadSignalHandler();
@@ -450,9 +467,10 @@ public class Main {
      * installReloadSignalHandler
      *
      * SIGHUP is the long-standing convention for asking a daemon to re-read its
-     * configuration, so it reloads the whitelist cache from the table. The
-     * control socket's "whitelist reload" does the same work; this stays as the
-     * out-of-band path for when the socket cannot be reached.
+     * configuration, so it reloads the whitelist and games caches from their
+     * tables. The control socket's "whitelist reload" and "games reload" do the
+     * same work; this stays as the out-of-band path for when the socket cannot
+     * be reached.
      *
      * Handling SIGHUP also overrides its default action, which is to terminate
      * the process.
@@ -464,14 +482,18 @@ public class Main {
                  * database I/O, so the reload is handed to a worker. */
                 controlWorkerPool.execute(() -> {
                     try {
-                        int size = reloadWhitelistCache();
-                        log.info("SIGHUP: whitelist cache reloaded, now {} entr(ies)", size);
+                        int whitelistSize = reloadListCache(LIST_WHITELIST);
+                        int gamesSize = reloadListCache(LIST_GAMES);
+                        log.info("SIGHUP: whitelist cache reloaded, now {} entr(ies); "
+                                + "games cache reloaded, now {} entr(ies)",
+                                whitelistSize, gamesSize);
                     } catch (SQLException e) {
-                        log.error("SIGHUP: whitelist reload failed: {}", e.getMessage());
+                        log.error("SIGHUP: list reload failed: {}", e.getMessage());
                     }
                 });
             });
-            log.info("Send SIGHUP to pid {} to reload the whitelist cache", ProcessHandle.current().pid());
+            log.info("Send SIGHUP to pid {} to reload the whitelist and games caches",
+                    ProcessHandle.current().pid());
         } catch (IllegalArgumentException | UnsupportedOperationException e) {
             log.error("Could not install SIGHUP handler; use the control socket to reload: {}", e.toString());
         }
@@ -607,10 +629,14 @@ public class Main {
                 return "ok" + CONTROL_FIELD_SEPARATOR + "pong";
 
             case "whitelist":
-                return executeWhitelistCommand(subcommand, fields);
+                return executeListCommand(LIST_WHITELIST, subcommand, fields);
+
+            case "games":
+                return executeListCommand(LIST_GAMES, subcommand, fields);
 
             case "stats":
                 return "ok" + CONTROL_FIELD_SEPARATOR + "whitelist=" + whitelistCache.size()
+                        + CONTROL_FIELD_SEPARATOR + "games=" + gamesCache.size()
                         + CONTROL_FIELD_SEPARATOR + "dnscache=" + dnsMemoryCache.size()
                         + CONTROL_FIELD_SEPARATOR + "allowlocal=" + allowLocalNames
                         + CONTROL_FIELD_SEPARATOR + "default=" + defaultMode.get()
@@ -640,12 +666,15 @@ public class Main {
     }
 
     /******************************************************************************
-     * executeWhitelistCommand
+     * executeListCommand
+     *
+     * Backs "whitelist|add|remove|reload" and the same verbs for "games". The
+     * web UI writes the table first and then sends the matching verb here.
      ******************************************************************************/
-    private static String executeWhitelistCommand(String subcommand, String[] fields) {
+    private static String executeListCommand(String list, String subcommand, String[] fields) {
         if ("reload".equals(subcommand)) {
             try {
-                int size = reloadWhitelistCache();
+                int size = reloadListCache(list);
                 return "ok" + CONTROL_FIELD_SEPARATOR + size;
             } catch (SQLException e) {
                 return controlError("reload failed: " + e.getMessage());
@@ -654,11 +683,11 @@ public class Main {
 
         boolean isAdd = "add".equals(subcommand);
         if (!isAdd && !"remove".equals(subcommand)) {
-            return controlError("whitelist takes 'add', 'remove' or 'reload', got '"
+            return controlError(list + " takes 'add', 'remove' or 'reload', got '"
                     + abbreviate(subcommand) + "'");
         }
         if (fields.length < 3) {
-            return controlError("whitelist " + subcommand + " requires a domain");
+            return controlError(list + " " + subcommand + " requires a domain");
         }
 
         /* Normalized here rather than trusting the caller, so the cache key
@@ -672,16 +701,17 @@ public class Main {
                     + " (e.g. example.com)");
         }
 
-        boolean changed = isAdd ? whitelistCache.add(domain) : whitelistCache.remove(domain);
+        Set<String> cache = cacheForList(list);
+        boolean changed = isAdd ? cache.add(domain) : cache.remove(domain);
 
         /* "already present" and "added" are both success: the caller asked for a
          * state, and that state now holds. Reporting the distinction is still
          * useful when tracing a UI and daemon that disagree. */
-        log.info("Control: whitelist {} '{}' ({}); cache now holds {} entr(ies)",
-                 subcommand, domain, changed ? "changed" : "no change", whitelistCache.size());
+        log.info("Control: {} {} '{}' ({}); cache now holds {} entr(ies)",
+                 list, subcommand, domain, changed ? "changed" : "no change", cache.size());
 
         return "ok" + CONTROL_FIELD_SEPARATOR + (changed ? "changed" : "unchanged")
-                + CONTROL_FIELD_SEPARATOR + whitelistCache.size();
+                + CONTROL_FIELD_SEPARATOR + cache.size();
     }
 
     /******************************************************************************
@@ -697,13 +727,13 @@ public class Main {
         if ("global".equals(subcommand)) {
             return controlError(verb + " global is no longer supported; use "
                     + "default" + CONTROL_FIELD_SEPARATOR + "set" + CONTROL_FIELD_SEPARATOR
-                    + "<allowall|filtered|blocked>");
+                    + "<allowall|games|whitelist|blocked>");
         }
 
         if ("ip".equals(subcommand)) {
             return controlError(verb + " ip is no longer supported; use "
                     + "client" + CONTROL_FIELD_SEPARATOR + "set" + CONTROL_FIELD_SEPARATOR
-                    + "<ip>" + CONTROL_FIELD_SEPARATOR + "<allowall|filtered|blocked|default>");
+                    + "<ip>" + CONTROL_FIELD_SEPARATOR + "<allowall|games|whitelist|blocked|default>");
         }
 
         return controlError(verb + " is no longer supported; use 'default|set' or 'client|set'");
@@ -712,7 +742,7 @@ public class Main {
     /******************************************************************************
      * executeDefaultCommand
      *
-     * Backs "default|set|<allowall|filtered|blocked>".
+     * Backs "default|set|<allowall|games|whitelist|blocked>".
      *
      * The table is written before the in-memory state so that a failed write
      * leaves the two agreeing rather than running in a state that would vanish
@@ -729,7 +759,7 @@ public class Main {
         String mode = normalizeMode(fields[2]);
         if (mode == null) {
             return controlError("invalid policy '" + abbreviate(fields[2])
-                    + "': expected allowall, filtered or blocked");
+                    + "': expected allowall, games, whitelist or blocked");
         }
 
         try {
@@ -747,7 +777,7 @@ public class Main {
     /******************************************************************************
      * executeClientCommand
      *
-     * Backs "client|set|<ip>|<allowall|filtered|blocked|default>".
+     * Backs "client|set|<ip>|<allowall|games|whitelist|blocked|default>".
      *
      * "default" is not a policy but a request to clear this client's own, so it
      * stores NULL and drops the map entry, leaving the client to follow whatever
@@ -770,7 +800,7 @@ public class Main {
         String mode = inherit ? null : normalizeMode(fields[3]);
         if (mode == null && !inherit) {
             return controlError("invalid policy '" + abbreviate(fields[3])
-                    + "': expected allowall, filtered, blocked or default");
+                    + "': expected allowall, games, whitelist, blocked or default");
         }
 
         try {
@@ -872,12 +902,25 @@ public class Main {
                 "date_approved DATETIME" +
                 ");";
 
-        String createDeniedSql = "CREATE TABLE IF NOT EXISTS history (" +
+        /* Same shape as the whitelist, and empty until an administrator adds a
+         * name. A games-policy client may resolve either list; a whitelist-policy
+         * client never consults this table. */
+        String createGamesSql = "CREATE TABLE IF NOT EXISTS games (" +
                 "name TEXT PRIMARY KEY, " +
+                "date_approved DATETIME" +
+                ");";
+
+        /* client_ip is part of the key so the same name can be counted once
+         * per client. A blank address is only the rows copied from the older
+         * table, which did not record who asked. */
+        String createDeniedSql = "CREATE TABLE IF NOT EXISTS history (" +
+                "name TEXT NOT NULL, " +
+                "client_ip TEXT NOT NULL DEFAULT '', " +
                 "count INTEGER, " +
                 "last_seen DATETIME, " +
                 "allowed_count INTEGER NOT NULL DEFAULT 0, " +
-                "allowed_last_seen DATETIME" +
+                "allowed_last_seen DATETIME, " +
+                "PRIMARY KEY (name, client_ip)" +
                 ");";
 
         /* Daemon-owned operational state. Unlike the whitelist, which the web UI
@@ -904,6 +947,7 @@ public class Main {
         try (Connection conn = getDbConnection();
              Statement stmt = conn.createStatement()) {
             stmt.execute(createWhitelistSql);
+            stmt.execute(createGamesSql);
             stmt.execute(createDeniedSql);
             stmt.execute(createSettingsSql);
             stmt.execute(createClientsSql);
@@ -912,6 +956,7 @@ public class Main {
              * the two-counter schema, so add the columns in place. */
             addColumnIfMissing(conn, "history", "allowed_count", "INTEGER NOT NULL DEFAULT 0");
             addColumnIfMissing(conn, "history", "allowed_last_seen", "DATETIME");
+            migrateHistoryClientIp(conn);
 
             /* Entries approved before this column existed keep a NULL here,
              * which is the honest answer: the date was never recorded. The
@@ -921,9 +966,57 @@ public class Main {
             migrateClientEnabledToMode(conn);
             migrateClientModeNullable(conn);
             migrateGlobalEnabledToDefaultMode(conn);
+            migrateFilteredToWhitelist(conn);
         } catch (SQLException e) {
             log.error("CRITICAL: Database initialization failed for '{}': {}", dbPath, e.getMessage());
             System.exit(2);
+        }
+    }
+
+    /******************************************************************************
+     * migrateHistoryClientIp
+     *
+     * history used to be one row per domain. The primary key is now the domain
+     * plus the client address. Existing rows are copied with a blank address,
+     * because the old table did not record who asked, and their counts stay on
+     * that row rather than being invented for a client.
+     *
+     * SQLite cannot add a column into the primary key in place, so the table is
+     * rebuilt. Done only when client_ip is absent, and only here: the web UI
+     * must not rebuild the table while an older daemon is still writing
+     * ON CONFLICT(name).
+     ******************************************************************************/
+    private static void migrateHistoryClientIp(Connection conn) throws SQLException {
+        if (hasColumn(conn, "history", "client_ip")) {
+            return;
+        }
+
+        boolean autoCommit = conn.getAutoCommit();
+        conn.setAutoCommit(false);
+        try (Statement stmt = conn.createStatement()) {
+            stmt.execute("CREATE TABLE history_migrate (" +
+                    "name TEXT NOT NULL, " +
+                    "client_ip TEXT NOT NULL DEFAULT '', " +
+                    "count INTEGER, " +
+                    "last_seen DATETIME, " +
+                    "allowed_count INTEGER NOT NULL DEFAULT 0, " +
+                    "allowed_last_seen DATETIME, " +
+                    "PRIMARY KEY (name, client_ip)" +
+                    ");");
+            int copied = stmt.executeUpdate(
+                    "INSERT INTO history_migrate " +
+                    "(name, client_ip, count, last_seen, allowed_count, allowed_last_seen) " +
+                    "SELECT name, '', count, last_seen, allowed_count, allowed_last_seen FROM history;");
+            stmt.execute("DROP TABLE history;");
+            stmt.execute("ALTER TABLE history_migrate RENAME TO history;");
+            conn.commit();
+            log.info("Rebuilt history with client_ip; {} existing row(s) kept with an unknown client",
+                    copied);
+        } catch (SQLException e) {
+            conn.rollback();
+            throw e;
+        } finally {
+            conn.setAutoCommit(autoCommit);
         }
     }
 
@@ -939,7 +1032,7 @@ public class Main {
             return;
         }
         addColumnIfMissing(conn, "clients", "mode",
-                           "TEXT NOT NULL DEFAULT '" + MODE_FILTERED + "'");
+                           "TEXT NOT NULL DEFAULT '" + MODE_FILTERED_LEGACY + "'");
 
         try (Statement stmt = conn.createStatement()) {
             int moved = stmt.executeUpdate(
@@ -983,7 +1076,7 @@ public class Main {
                     ");");
             int inherited = stmt.executeUpdate(
                     "INSERT INTO clients_migrate (ip, hostname, mode, query_count, first_seen, last_seen) " +
-                    "SELECT ip, hostname, NULLIF(mode, '" + MODE_FILTERED + "'), " +
+                    "SELECT ip, hostname, NULLIF(mode, '" + MODE_FILTERED_LEGACY + "'), " +
                     "query_count, first_seen, last_seen FROM clients;");
             stmt.execute("DROP TABLE clients;");
             stmt.execute("ALTER TABLE clients_migrate RENAME TO clients;");
@@ -1021,7 +1114,7 @@ public class Main {
             return;
         }
 
-        String mode = "0".equals(legacy) ? MODE_BLOCKED : MODE_FILTERED;
+        String mode = "0".equals(legacy) ? MODE_BLOCKED : MODE_WHITELIST;
 
         /* Only seeds the new setting; an explicit default already chosen wins. */
         try (PreparedStatement stmt = conn.prepareStatement(
@@ -1036,6 +1129,29 @@ public class Main {
             stmt.executeUpdate();
         }
         log.info("Migrated settings.global_enabled ({}) to default policy '{}'", legacy, mode);
+    }
+
+    /******************************************************************************
+     * migrateFilteredToWhitelist
+     *
+     * "filtered" was whitelist-only. That behaviour is now the whitelist policy,
+     * and games is a separate wider policy that starts unused. Rewriting the
+     * stored value keeps every client that was filtered on whitelist-only.
+     ******************************************************************************/
+    private static void migrateFilteredToWhitelist(Connection conn) throws SQLException {
+        try (Statement stmt = conn.createStatement()) {
+            int settings = stmt.executeUpdate(
+                    "UPDATE settings SET value = '" + MODE_WHITELIST + "' "
+                    + "WHERE key = '" + SETTING_DEFAULT_MODE + "' "
+                    + "AND value = '" + MODE_FILTERED_LEGACY + "';");
+            int clients = stmt.executeUpdate(
+                    "UPDATE clients SET mode = '" + MODE_WHITELIST + "' "
+                    + "WHERE mode = '" + MODE_FILTERED_LEGACY + "';");
+            if (settings > 0 || clients > 0) {
+                log.info("Migrated filtered policy to whitelist ({} setting, {} client(s))",
+                        settings, clients);
+            }
+        }
     }
 
     /******************************************************************************
@@ -1079,9 +1195,13 @@ public class Main {
      ******************************************************************************/
     private static String normalizeMode(String value) {
         String candidate = value == null ? "" : value.trim().toLowerCase(Locale.ROOT);
-        if (MODE_ALLOW_ALL.equals(candidate) || MODE_FILTERED.equals(candidate)
-                || MODE_BLOCKED.equals(candidate)) {
+        if (MODE_ALLOW_ALL.equals(candidate) || MODE_GAMES.equals(candidate)
+                || MODE_WHITELIST.equals(candidate) || MODE_BLOCKED.equals(candidate)) {
             return candidate;
+        }
+        /* A row the migration did not reach still means whitelist-only. */
+        if (MODE_FILTERED_LEGACY.equals(candidate)) {
+            return MODE_WHITELIST;
         }
         return null;
     }
@@ -1106,7 +1226,7 @@ public class Main {
      ******************************************************************************/
     private static void loadControlState() {
         try (Connection conn = getDbConnection()) {
-            String mode = MODE_FILTERED;
+            String mode = MODE_WHITELIST;
             try (PreparedStatement stmt =
                          conn.prepareStatement("SELECT value FROM settings WHERE key = ?;")) {
                 stmt.setString(1, SETTING_DEFAULT_MODE);
@@ -1136,10 +1256,11 @@ public class Main {
             log.info("Default policy is '{}'; {} client(s) carry a policy of their own",
                      mode, clientModes.size());
         } catch (SQLException e) {
-            /* Left at 'filtered': refusing every query because a settings row
-             * could not be read would be a worse failure. */
+            /* Left at 'whitelist': refusing every query because a settings row
+             * could not be read would be a worse failure, and opening the
+             * games list would be a change the administrator did not ask for. */
             log.error("Failed to load control state, defaulting to '{}': {}",
-                      MODE_FILTERED, e.getMessage());
+                      MODE_WHITELIST, e.getMessage());
         }
     }
 
@@ -1393,22 +1514,40 @@ public class Main {
     }
 
     /******************************************************************************
-     * loadWhitelistCache
+     * cacheForList
+     *
+     * Only the two known lists are ever passed. Anything else is a programming
+     * error and must not silently write the whitelist.
      ******************************************************************************/
-    private static void loadWhitelistCache() {
-        try {
-            whitelistCache.addAll(readWhitelistTable());
-        } catch (SQLException e) {
-            log.error("CRITICAL: Failed to load whitelist table: {}", e.getMessage());
-            System.exit(2);
+    private static Set<String> cacheForList(String list) {
+        if (LIST_WHITELIST.equals(list)) {
+            return whitelistCache;
         }
-        log.info("Loaded {} whitelist entr(ies) into memory cache", whitelistCache.size());
+        if (LIST_GAMES.equals(list)) {
+            return gamesCache;
+        }
+        throw new IllegalArgumentException("unknown list '" + list + "'");
     }
 
     /******************************************************************************
-     * reloadWhitelistCache
+     * loadDomainCaches
+     ******************************************************************************/
+    private static void loadDomainCaches() {
+        try {
+            whitelistCache.addAll(readListTable(LIST_WHITELIST));
+            gamesCache.addAll(readListTable(LIST_GAMES));
+        } catch (SQLException e) {
+            log.error("CRITICAL: Failed to load domain lists: {}", e.getMessage());
+            System.exit(2);
+        }
+        log.info("Loaded {} whitelist entr(ies) and {} games entr(ies) into memory",
+                whitelistCache.size(), gamesCache.size());
+    }
+
+    /******************************************************************************
+     * reloadListCache
      *
-     * Re-reads the whitelist table and converges the cache on it, which is how a
+     * Re-reads one list and converges its cache on the table, which is how a
      * change made outside the control socket (a direct sqlite3 edit, or a change
      * made while the daemon was down) reaches the resolver.
      *
@@ -1416,18 +1555,23 @@ public class Main {
      * momentarily absent; clearing first would deny live queries for the length
      * of the reload.
      ******************************************************************************/
-    private static int reloadWhitelistCache() throws SQLException {
-        Set<String> loaded = readWhitelistTable();
-        whitelistCache.addAll(loaded);
-        whitelistCache.retainAll(loaded);
-        return whitelistCache.size();
+    private static int reloadListCache(String list) throws SQLException {
+        Set<String> cache = cacheForList(list);
+        Set<String> loaded = readListTable(list);
+        cache.addAll(loaded);
+        cache.retainAll(loaded);
+        return cache.size();
     }
 
     /******************************************************************************
-     * readWhitelistTable
+     * readListTable
+     *
+     * $list is one of the two constant names, concatenated into SQL only after
+     * cacheForList has accepted it.
      ******************************************************************************/
-    private static Set<String> readWhitelistTable() throws SQLException {
-        String selectSql = "SELECT name FROM whitelist;";
+    private static Set<String> readListTable(String list) throws SQLException {
+        cacheForList(list);
+        String selectSql = "SELECT name FROM " + list + ";";
         Set<String> loaded = new HashSet<>();
         try (Connection conn = getDbConnection();
              Statement stmt = conn.createStatement();
@@ -1439,12 +1583,12 @@ public class Main {
                     loaded.add(domain);
                 } else if (!domain.isEmpty()) {
                     rejected++;
-                    log.warn("Ignoring invalid whitelist entry '{}': entries must have at least " +
-                            "two labels (e.g. example.com)", domain);
+                    log.warn("Ignoring invalid {} entry '{}': entries must have at least " +
+                            "two labels (e.g. example.com)", list, domain);
                 }
             }
             if (rejected > 0) {
-                log.warn("Ignored {} invalid whitelist entr(ies)", rejected);
+                log.warn("Ignored {} invalid {} entr(ies)", rejected, list);
             }
         }
         return loaded;
@@ -1593,17 +1737,20 @@ public class Main {
                 return serialize(errorResponse(request, Rcode.NXDOMAIN, question), request, viaTcp);
             }
 
-            /* An unfiltered client is treated exactly as though every name were
-             * approved, so it takes the same resolve-and-cache path and its
-             * traffic is counted the same way. */
+            /* Allow all skips both lists. Whitelist allows the whitelist and
+             * local names. Games allows those plus the games list. Local names
+             * stay allowed for both, matching the old filtered behaviour; block
+             * all already returned above, so it still refuses them. */
             if (MODE_ALLOW_ALL.equals(mode)
-                    || isWhitelisted(domain) || (allowLocalNames && isLocalName(domain))) {
-                recordAllowedHit(domain);
+                    || isWhitelisted(domain)
+                    || (MODE_GAMES.equals(mode) && isGames(domain))
+                    || (allowLocalNames && isLocalName(domain))) {
+                recordAllowedHit(domain, clientIp);
                 return serialize(resolveWhitelisted(request, question, domain), request, viaTcp);
             }
 
             log.info("DENY {} (type {}) from {}", domain, Type.string(question.getType()), clientAddr);
-            submitDbTask(() -> handleDeniedBackgroundLookup(domain));
+            submitDbTask(() -> handleDeniedBackgroundLookup(domain, clientIp));
             return serialize(errorResponse(request, Rcode.NXDOMAIN, question), request, viaTcp);
         } catch (Exception e) {
             log.warn("Failed to answer {} for {}: {}", domain, clientAddr, e.toString());
@@ -1816,8 +1963,9 @@ public class Main {
      * including local cache hits, so it must stay allocation-light and must not
      * touch the database.
      ******************************************************************************/
-    private static void recordAllowedHit(String domain) {
-        AllowedHit hit = pendingAllowedHits.computeIfAbsent(domain, key -> new AllowedHit());
+    private static void recordAllowedHit(String domain, String clientIp) {
+        AllowedHit hit = pendingAllowedHits.computeIfAbsent(
+                historyKey(domain, clientIp), key -> new AllowedHit());
         hit.count.incrementAndGet();
         hit.lastSeen = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
     }
@@ -1834,9 +1982,10 @@ public class Main {
             return;
         }
 
-        String upsertAllowedSql = "INSERT INTO history (name, count, last_seen, allowed_count, allowed_last_seen) " +
-                "VALUES (?, 0, NULL, ?, ?) " +
-                "ON CONFLICT(name) DO UPDATE SET " +
+        String upsertAllowedSql = "INSERT INTO history " +
+                "(name, client_ip, count, last_seen, allowed_count, allowed_last_seen) " +
+                "VALUES (?, ?, 0, NULL, ?, ?) " +
+                "ON CONFLICT(name, client_ip) DO UPDATE SET " +
                 "allowed_count = history.allowed_count + excluded.allowed_count, " +
                 "allowed_last_seen = excluded.allowed_last_seen;";
 
@@ -1851,9 +2000,12 @@ public class Main {
                         pendingAllowedHits.remove(entry.getKey(), hit);
                         continue;
                     }
-                    stmt.setString(1, entry.getKey());
-                    stmt.setLong(2, delta);
-                    stmt.setString(3, hit.lastSeen);
+                    String key = entry.getKey();
+                    int split = key.indexOf('\n');
+                    stmt.setString(1, split < 0 ? key : key.substring(0, split));
+                    stmt.setString(2, split < 0 ? "" : key.substring(split + 1));
+                    stmt.setLong(3, delta);
+                    stmt.setString(4, hit.lastSeen);
                     stmt.addBatch();
                 }
                 stmt.executeBatch();
@@ -1867,11 +2019,12 @@ public class Main {
     /******************************************************************************
      * handleDeniedBackgroundLookup
      ******************************************************************************/
-    private static void handleDeniedBackgroundLookup(String domain) {
+    private static void handleDeniedBackgroundLookup(String domain, String clientIp) {
         String nowIso = DateTimeFormatter.ISO_INSTANT.format(Instant.now());
-        String upsertDeniedSql = "INSERT INTO history (name, count, last_seen) " +
-                "VALUES (?, 1, ?) " +
-                "ON CONFLICT(name) DO UPDATE SET " +
+        String address = clientIp == null ? "" : clientIp;
+        String upsertDeniedSql = "INSERT INTO history (name, client_ip, count, last_seen) " +
+                "VALUES (?, ?, 1, ?) " +
+                "ON CONFLICT(name, client_ip) DO UPDATE SET " +
                 "count = history.count + 1, " +
                 "last_seen = excluded.last_seen;";
 
@@ -1880,7 +2033,8 @@ public class Main {
         try (Connection conn = getDbConnection()) {
             try (PreparedStatement deniedStmt = conn.prepareStatement(upsertDeniedSql)) {
                 deniedStmt.setString(1, domain);
-                deniedStmt.setString(2, nowIso);
+                deniedStmt.setString(2, address);
+                deniedStmt.setString(3, nowIso);
                 deniedStmt.executeUpdate();
             }
 
@@ -1888,32 +2042,12 @@ public class Main {
                 return;
             }
 
-            /* The entry that covers this name may be any of its parent domains,
-             * so every candidate suffix has to be checked, not just the exact
-             * name that was queried.
-             *
-             * COLLATE must sit on the column here; "name IN (...) COLLATE
-             * NOCASE" parses but silently matches nothing. */
-            StringBuilder sql = new StringBuilder(
-                    "SELECT name FROM whitelist WHERE name COLLATE NOCASE IN (");
-            for (int i = 0; i < candidates.size(); i++) {
-                sql.append(i == 0 ? "?" : ",?");
-            }
-            sql.append(");");
-
-            try (PreparedStatement checkStmt = conn.prepareStatement(sql.toString())) {
-                for (int i = 0; i < candidates.size(); i++) {
-                    checkStmt.setString(i + 1, candidates.get(i));
-                }
-                try (ResultSet rs = checkStmt.executeQuery()) {
-                    while (rs.next()) {
-                        String allowed = normalizeDomain(rs.getString("name"));
-                        if (isValidWhitelistEntry(allowed) && whitelistCache.add(allowed)) {
-                            log.info("Whitelist cache updated from database: {} (covers {})", allowed, domain);
-                        }
-                    }
-                }
-            }
+            /* A denied name can still have a parent in either table when the
+             * cache is behind a direct edit. Refresh both, including the list
+             * this policy did not consult, so the next client on the other
+             * policy sees the row. */
+            refreshListCacheFromCandidates(conn, LIST_WHITELIST, candidates, domain);
+            refreshListCacheFromCandidates(conn, LIST_GAMES, candidates, domain);
         } catch (SQLException e) {
             log.warn("Failed to record denied request for {}: {}", domain, e.getMessage());
         }
@@ -1933,22 +2067,63 @@ public class Main {
     }
 
     /******************************************************************************
-     * isWhitelisted
+     * refreshListCacheFromCandidates
      *
-     * A whitelist entry covers the domain itself and every subdomain of it, so
+     * COLLATE must sit on the column; "name IN (...) COLLATE NOCASE" parses but
+     * silently matches nothing.
+     ******************************************************************************/
+    private static void refreshListCacheFromCandidates(Connection conn, String list,
+                                                       List<String> candidates, String domain)
+            throws SQLException {
+        StringBuilder sql = new StringBuilder("SELECT name FROM ")
+                .append(list)
+                .append(" WHERE name COLLATE NOCASE IN (");
+        for (int i = 0; i < candidates.size(); i++) {
+            sql.append(i == 0 ? "?" : ",?");
+        }
+        sql.append(");");
+
+        Set<String> cache = cacheForList(list);
+        try (PreparedStatement checkStmt = conn.prepareStatement(sql.toString())) {
+            for (int i = 0; i < candidates.size(); i++) {
+                checkStmt.setString(i + 1, candidates.get(i));
+            }
+            try (ResultSet rs = checkStmt.executeQuery()) {
+                while (rs.next()) {
+                    String allowed = normalizeDomain(rs.getString("name"));
+                    if (isValidWhitelistEntry(allowed) && cache.add(allowed)) {
+                        log.info("{} cache updated from database: {} (covers {})", list, allowed, domain);
+                    }
+                }
+            }
+        }
+    }
+
+    /******************************************************************************
+     * isListed
+     *
+     * An entry covers the domain itself and every subdomain of it, so
      * "microsoft.com" permits both "microsoft.com" and "whatever.microsoft.com".
      *
-     * Rather than scanning every whitelist entry, this walks the query name up
-     * to the root, which is a handful of hash lookups regardless of how large
-     * the whitelist is.
+     * Rather than scanning every entry, this walks the query name up to the
+     * root, which is a handful of hash lookups regardless of how large the
+     * list is.
      ******************************************************************************/
-    private static boolean isWhitelisted(String domain) {
+    private static boolean isListed(Set<String> cache, String domain) {
         for (String candidate : candidateSuffixes(domain)) {
-            if (whitelistCache.contains(candidate)) {
+            if (cache.contains(candidate)) {
                 return true;
             }
         }
         return false;
+    }
+
+    private static boolean isWhitelisted(String domain) {
+        return isListed(whitelistCache, domain);
+    }
+
+    private static boolean isGames(String domain) {
+        return isListed(gamesCache, domain);
     }
 
     /******************************************************************************

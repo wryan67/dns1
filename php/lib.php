@@ -36,7 +36,38 @@ function getDb() {
     $db->setAttribute(PDO::ATTR_ERRMODE, PDO::ERRMODE_EXCEPTION);
     $db->exec('PRAGMA journal_mode=WAL');
     $db->exec('PRAGMA busy_timeout=5000');
+    ensureDns1Schema($db);
     return $db;
+}
+
+/* The games list matches the whitelist's shape and starts empty. "filtered"
+ * was whitelist-only; that behaviour is now the whitelist policy, so rewrite
+ * any stored value before the control page draws it. Both statements are
+ * idempotent. The daemon performs the same migration at startup. */
+function ensureDns1Schema($db) {
+    $db->exec("CREATE TABLE IF NOT EXISTS games (
+        name TEXT PRIMARY KEY,
+        date_approved DATETIME
+    )");
+    $db->exec("UPDATE settings SET value = 'whitelist'
+               WHERE key = 'default_mode' AND value = 'filtered'");
+    $db->exec("UPDATE clients SET mode = 'whitelist' WHERE mode = 'filtered'");
+}
+
+/* True after the daemon has rebuilt history with a client address. The web UI
+ * does not rebuild that table itself. */
+function historyHasClientIp($db) {
+    foreach ($db->query('PRAGMA table_info(history)') as $row) {
+        if (strcasecmp($row['name'], 'client_ip') === 0) return true;
+    }
+    return false;
+}
+
+function domainList($name) {
+    if ($name !== 'whitelist' && $name !== 'games') {
+        return null;
+    }
+    return $name;
 }
 
 function jsonOut($payload) {
@@ -195,13 +226,19 @@ function candidateSuffixes($domain) {
     return $out;
 }
 
-function loadWhitelistSet($db) {
+function loadDomainSet($db, $list) {
+    $list = domainList($list);
+    if ($list === null) return [];
     $set = [];
-    foreach ($db->query('SELECT name FROM whitelist') as $row) {
+    foreach ($db->query('SELECT name FROM ' . $list) as $row) {
         $n = normalizeDomain($row['name']);
         if ($n !== '') $set[$n] = true;
     }
     return $set;
+}
+
+function loadWhitelistSet($db) {
+    return loadDomainSet($db, 'whitelist');
 }
 
 function isWhitelisted($domain, $whitelistSet) {
@@ -214,11 +251,12 @@ function isWhitelisted($domain, $whitelistSet) {
 /* The inverse of isWhitelisted: existing entries that $name would now cover,
  * because $name is one of their parent suffixes. Adding "google.com" makes an
  * existing "www.google.com" redundant, since the daemon matches it either way. */
-function redundantChildren($db, $name) {
+function redundantChildren($db, $name, $list = 'whitelist') {
     $name = normalizeDomain($name);
+    $list = domainList($list);
     $out  = [];
-    if ($name === '') return $out;
-    foreach ($db->query('SELECT name FROM whitelist') as $row) {
+    if ($name === '' || $list === null) return $out;
+    foreach ($db->query('SELECT name FROM ' . $list) as $row) {
         $existing = normalizeDomain($row['name']);
         if ($existing === '' || $existing === $name) continue;
         foreach (candidateSuffixes($existing) as $suffix) {
@@ -312,8 +350,16 @@ function joinNotes(...$notes) {
  * which is returned as a warning rather than an error so the caller can say so
  * instead of reporting a success that has not reached the resolver.
  ******************************************************************************/
-function applyWhitelistChange($db, $action, $name, $approvedAt = false) {
+function listLabel($list) {
+    return $list === 'games' ? 'games list' : 'whitelist';
+}
+
+function applyListChange($db, $list, $action, $name, $approvedAt = false) {
+    $list = domainList($list);
     $name = normalizeDomain($name);
+    if ($list === null) {
+        return [false, 'Unknown list.'];
+    }
     if (!isValidWhitelistEntry($name)) {
         return [false, 'Name must be a dotted domain of letters, digits, hyphen or underscore (e.g. example.com).'];
     }
@@ -328,10 +374,10 @@ function applyWhitelistChange($db, $action, $name, $approvedAt = false) {
                OR IGNORE means re-adding an existing name keeps its original
                approval date rather than moving it to now. */
             $stamp = $approvedAt === false ? gmdate('Y-m-d\TH:i:s\Z') : $approvedAt;
-            $db->prepare('INSERT OR IGNORE INTO whitelist (name, date_approved) VALUES (?, ?)')
+            $db->prepare('INSERT OR IGNORE INTO ' . $list . ' (name, date_approved) VALUES (?, ?)')
                ->execute([$name, $stamp]);
         } else {
-            $db->prepare('DELETE FROM whitelist WHERE name = ? COLLATE NOCASE')->execute([$name]);
+            $db->prepare('DELETE FROM ' . $list . ' WHERE name = ? COLLATE NOCASE')->execute([$name]);
         }
         $db->commit();
     } catch (Exception $e) {
@@ -341,12 +387,91 @@ function applyWhitelistChange($db, $action, $name, $approvedAt = false) {
 
     /* Notified only after the commit, so the cache is never told about a change
      * that the transaction then rolled back. */
-    [$ok, $detail] = daemonCommand(['whitelist', $action === 'insert' ? 'add' : 'remove', $name]);
+    [$ok, $detail] = daemonCommand([$list, $action === 'insert' ? 'add' : 'remove', $name]);
     $warning = $ok ? null
         : 'Saved, but the DNS daemon did not confirm (' . $detail . '). '
           . 'The change takes effect when it reloads or restarts.';
 
     return [true, $name, $warning];
+}
+
+function applyWhitelistChange($db, $action, $name, $approvedAt = false) {
+    return applyListChange($db, 'whitelist', $action, $name, $approvedAt);
+}
+
+/******************************************************************************
+ * moveBetweenLists
+ *
+ * Removes $name from one list and places it on the other, keeping the
+ * approval date. When the destination already covers the name, the destination
+ * is left as it is and the source row is still removed.
+ *
+ * The destination add is sent before the source remove, so a name that is
+ * moving is never absent from both caches.
+ ******************************************************************************/
+function moveBetweenLists($db, $from, $to, $name) {
+    $from = domainList($from);
+    $to   = domainList($to);
+    $name = normalizeDomain($name);
+    if ($from === null || $to === null || $from === $to) {
+        return [false, 'Unknown list.'];
+    }
+    if (!isValidWhitelistEntry($name)) {
+        return [false, 'Name must be a dotted domain of letters, digits, hyphen or underscore (e.g. example.com).'];
+    }
+
+    $db->beginTransaction();
+    try {
+        $prev = $db->prepare('SELECT date_approved FROM ' . $from . ' WHERE name = ? COLLATE NOCASE');
+        $prev->execute([$name]);
+        $row = $prev->fetch(PDO::FETCH_ASSOC);
+        if (!$row) {
+            $db->rollBack();
+            return [false, $name . ' is not on the ' . listLabel($from) . '.'];
+        }
+
+        $covering = isWhitelisted($name, loadDomainSet($db, $to));
+        if ($covering === null) {
+            $db->prepare('INSERT OR IGNORE INTO ' . $to . ' (name, date_approved) VALUES (?, ?)')
+               ->execute([$name, $row['date_approved']]);
+        }
+        $db->prepare('DELETE FROM ' . $from . ' WHERE name = ? COLLATE NOCASE')->execute([$name]);
+        $db->commit();
+    } catch (Exception $e) {
+        if ($db->inTransaction()) $db->rollBack();
+        return [false, 'Database error: ' . $e->getMessage()];
+    }
+
+    $warnings = [];
+    if ($covering === null) {
+        [$ok, $detail] = daemonCommand([$to, 'add', $name]);
+        if (!$ok) {
+            $warnings[] = 'Saved, but the DNS daemon did not confirm the add (' . $detail . ').';
+        }
+    }
+    [$ok, $detail] = daemonCommand([$from, 'remove', $name]);
+    if (!$ok) {
+        $warnings[] = 'Saved, but the DNS daemon did not confirm the remove (' . $detail . ').';
+    }
+    if ($warnings) {
+        $warnings[] = 'The change takes effect when it reloads or restarts.';
+    }
+
+    $note = null;
+    if ($covering !== null) {
+        $note = $covering === $name
+            ? $name . ' was already on the ' . listLabel($to) . '.'
+            : $name . ' is already covered by ' . $covering . ' on the ' . listLabel($to) . '.';
+    } else {
+        $absorbed = redundantChildren($db, $name, $to);
+        if (count($absorbed) === 1) {
+            $note = $absorbed[0] . ' is now redundant.';
+        } elseif (count($absorbed) > 1) {
+            $note = count($absorbed) . ' existing entries are now redundant.';
+        }
+    }
+
+    return [true, $name, joinNotes($note, $warnings ? implode(' ', $warnings) : null)];
 }
 
 /******************************************************************************

@@ -43,36 +43,94 @@ if ($api === 'whitelist_data') {
     ]);
 }
 
+/* ---- Bootgrid: games ---- */
+if ($api === 'games_data') {
+    [$current, $rowCount, $where, $params, $orderBy] =
+        bootgridParams(['name'], ['name', 'date_approved'], '"name" ASC');
+
+    $countStmt = $db->prepare("SELECT COUNT(*) AS c FROM games {$where}");
+    $countStmt->execute($params);
+    $total = (int)$countStmt->fetch(PDO::FETCH_ASSOC)['c'];
+
+    $sql = "SELECT name, date_approved FROM games {$where} ORDER BY {$orderBy}";
+    if ($rowCount > 0) {
+        $sql .= ' LIMIT ' . (int)$rowCount . ' OFFSET ' . (int)(($current - 1) * $rowCount);
+    }
+    $stmt = $db->prepare($sql);
+    $stmt->execute($params);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+
+    jsonOut([
+        'current'  => $current,
+        'rowCount' => $rowCount,
+        'total'    => $total,
+        'rows'     => $rows
+    ]);
+}
+
+/* ---- History client dropdown ---- */
+if ($api === 'history_clients') {
+    if (!historyHasClientIp($db)) {
+        jsonOut(['success' => true, 'ready' => false, 'clients' => []]);
+    }
+    $rows = $db->query(
+        "SELECT h.client_ip AS ip,
+                (SELECT c.hostname FROM clients c WHERE c.ip = h.client_ip) AS hostname
+         FROM history h
+         WHERE h.client_ip <> ''
+         GROUP BY h.client_ip
+         ORDER BY h.client_ip"
+    )->fetchAll(PDO::FETCH_ASSOC);
+    jsonOut(['success' => true, 'ready' => true, 'clients' => $rows]);
+}
+
 /* ---- Bootgrid: history ---- */
 if ($api === 'history_data') {
+    $hasClient = historyHasClientIp($db);
+    $sortable = ['name', 'count', 'last_seen', 'allowed_count', 'allowed_last_seen',
+                 'total_count', 'last_any'];
+    if ($hasClient) $sortable[] = 'client_ip';
     [$current, $rowCount, $where, $params, $orderBy] =
-        bootgridParams(['name'],
-                       ['name', 'count', 'last_seen', 'allowed_count', 'allowed_last_seen',
-                        'total_count', 'last_any'],
-                       '"last_any" DESC');
+        bootgridParams(['name'], $sortable, '"last_any" DESC');
 
-    /* Mirrors isWhitelisted(): a row is allowed when the whitelist holds the name
-     * itself or any of its parent domains. The suffix test compares the trailing
-     * ".<entry>" via substr rather than LIKE, so an underscore or percent in an
-     * entry cannot act as a wildcard. */
-    $approvedExpr = "(EXISTS (SELECT 1 FROM whitelist w WHERE lower(history.name) = lower(w.name) "
-                  . "OR substr(lower(history.name), -(length(w.name) + 1)) = '.' || lower(w.name))";
+    /* A name is allowed when either list holds it or a parent, or it is a
+     * local single-label name. The suffix test compares the trailing ".<entry>"
+     * via substr rather than LIKE, so an underscore or percent in an entry
+     * cannot act as a wildcard. */
+    $coverExpr = function ($table, $alias) {
+        return "EXISTS (SELECT 1 FROM {$table} {$alias} WHERE lower(history.name) = lower({$alias}.name) "
+             . "OR substr(lower(history.name), -(length({$alias}.name) + 1)) = '.' || lower({$alias}.name))";
+    };
+    $whitelistExpr = '(' . $coverExpr('whitelist', 'w') . ')';
+    $gamesExpr     = '(' . $coverExpr('games', 'g') . ')';
+    $allowedExpr   = "({$whitelistExpr} OR {$gamesExpr}";
     if (ALLOW_LOCAL_NAMES) {
-        /* Single-label names are allowed as a class by the daemon, so the
-         * Blocked and Allowed views have to classify them the way the resolver
-         * does. instr() rather than LIKE, so no wildcard interpretation. */
-        $approvedExpr .= " OR instr(history.name, '.') = 0";
+        /* Single-label names are allowed as a class under Games and Whitelist,
+         * so the Blocked and Allowed views have to classify them the way the
+         * resolver does. instr() rather than LIKE, so no wildcard interpretation. */
+        $allowedExpr .= " OR instr(history.name, '.') = 0";
     }
     /* Parenthesised as a whole because it is also used as NOT (...); without the
      * outer parens the trailing OR would escape the negation. */
-    $approvedExpr .= ")";
+    $allowedExpr .= ")";
 
     $statusFilter = $_POST['status'] ?? 'all';
     $filterExpr   = '';
     if ($statusFilter === 'allowed') {
-        $filterExpr = $approvedExpr;
+        $filterExpr = $allowedExpr;
     } elseif ($statusFilter === 'blocked') {
-        $filterExpr = 'NOT ' . $approvedExpr;
+        $filterExpr = 'NOT ' . $allowedExpr;
+    }
+
+    /* Bound, and only after the search placeholders, so the parameter order
+     * matches the SQL. A value that is not an IP is ignored. */
+    $clientExpr = '';
+    if ($hasClient) {
+        $client = trim((string)($_POST['client'] ?? ''));
+        if ($client !== '' && filter_var($client, FILTER_VALIDATE_IP) !== false) {
+            $clientExpr = 'client_ip = ?';
+            $params[] = $client;
+        }
     }
 
     /* The summary columns follow the active filter: a Blocked view reports only
@@ -89,12 +147,16 @@ if ($api === 'history_data') {
         $totalExpr = '(COALESCE(count, 0) + COALESCE(allowed_count, 0))';
         $lastExpr  = 'COALESCE(MAX(last_seen, allowed_last_seen), last_seen, allowed_last_seen)';
     }
-    if ($filterExpr !== '') {
+    $extra = [];
+    if ($filterExpr !== '') $extra[] = $filterExpr;
+    if ($clientExpr !== '') $extra[] = $clientExpr;
+    if ($extra) {
         /* The search clause is parenthesised because bootgridParams ORs its
          * searchable columns together, and OR binds looser than AND. */
+        $joined = implode(' AND ', $extra);
         $where = ($where === '')
-            ? "WHERE {$filterExpr}"
-            : 'WHERE (' . substr($where, 6) . ") AND ({$filterExpr})";
+            ? "WHERE {$joined}"
+            : 'WHERE (' . substr($where, 6) . ") AND ({$joined})";
     }
 
     $countStmt = $db->prepare("SELECT COUNT(*) AS c FROM history {$where}");
@@ -106,7 +168,8 @@ if ($api === 'history_data') {
      * arguments is the scalar form and yields NULL if either side is NULL, so
      * COALESCE supplies the other one. Timestamps are ISO 8601, which compares
      * correctly as text. */
-    $sql = "SELECT name, count, last_seen, allowed_count, allowed_last_seen, "
+    $clientSelect = $hasClient ? 'client_ip' : "'' AS client_ip";
+    $sql = "SELECT name, {$clientSelect}, count, last_seen, allowed_count, allowed_last_seen, "
          . "{$totalExpr} AS total_count, "
          . "{$lastExpr} AS last_any "
          . "FROM history {$where} ORDER BY {$orderBy}";
@@ -117,17 +180,24 @@ if ($api === 'history_data') {
     $stmt->execute($params);
     $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
 
-    /* Approved means the name would now resolve, which covers three cases: listed
-     * outright, covered by a whitelisted parent domain, or allowed as a local
-     * single-label name. */
-    $whitelist = loadWhitelistSet($db);
+    /* Three list states, plus local names which stay in the Allowed filter:
+     * on the whitelist, on the games list only, or on neither. A whitelist hit
+     * wins when a name is on both lists. */
+    $whitelist = loadDomainSet($db, 'whitelist');
+    $games     = loadDomainSet($db, 'games');
     foreach ($rows as &$r) {
-        $name  = normalizeDomain($r['name']);
-        $match = isWhitelisted($name, $whitelist);
-        $local = $match === null && isAutoAllowed($name);
-        $r['approved']   = ($match !== null || $local) ? 1 : 0;
-        $r['covered_by'] = $match;
-        $r['local']      = $local ? 1 : 0;
+        $name       = normalizeDomain($r['name']);
+        $match      = isWhitelisted($name, $whitelist);
+        $gamesMatch = isWhitelisted($name, $games);
+        $local      = $match === null && $gamesMatch === null && isAutoAllowed($name);
+        $r['on_whitelist'] = $match !== null ? 1 : 0;
+        $r['on_games']     = $gamesMatch !== null ? 1 : 0;
+        $r['covered_by']   = $match;
+        $r['games_by']     = $gamesMatch;
+        $r['local']        = $local ? 1 : 0;
+        /* Approve is the whitelist action, so this stays true only when the
+         * whitelist already covers the name or the name cannot be listed. */
+        $r['approved']     = ($match !== null || $local) ? 1 : 0;
     }
     unset($r);
 
@@ -156,12 +226,17 @@ if ($api === 'client_data') {
     }
     $stmt = $db->prepare($sql);
     $stmt->execute($params);
+    $rows = $stmt->fetchAll(PDO::FETCH_ASSOC);
+    foreach ($rows as &$r) {
+        if (($r['mode'] ?? null) === 'filtered') $r['mode'] = 'whitelist';
+    }
+    unset($r);
 
     jsonOut([
         'current'  => $current,
         'rowCount' => $rowCount,
         'total'    => $total,
-        'rows'     => $stmt->fetchAll(PDO::FETCH_ASSOC)
+        'rows'     => $rows
     ]);
 }
 
@@ -174,7 +249,11 @@ if ($api === 'control_status') {
     if (!$ok) {
         jsonOut(['success' => false, 'error' => 'Daemon unreachable: ' . $detail]);
     }
-    jsonOut(['success' => true, 'mode' => $detail]);
+    /* status returns a single field. A daemon that has not migrated yet still
+     * says "filtered", which is whitelist-only. */
+    $mode = strtolower(trim($detail));
+    if ($mode === 'filtered') $mode = 'whitelist';
+    jsonOut(['success' => true, 'mode' => $mode]);
 }
 
 /* ---- Control mutations ----
@@ -190,7 +269,7 @@ if ($api === 'control_default' || $api === 'control_client') {
     $mode = strtolower(trim($_POST['mode'] ?? ''));
 
     if ($api === 'control_default') {
-        if (!in_array($mode, ['allowall', 'filtered', 'blocked'], true)) {
+        if (!in_array($mode, ['allowall', 'games', 'whitelist', 'blocked'], true)) {
             jsonOut(['success' => false, 'error' => 'Unknown default policy.']);
         }
         [$ok, $detail] = daemonCommand(['default', 'set', $mode]);
@@ -207,7 +286,7 @@ if ($api === 'control_default' || $api === 'control_client') {
     }
 
     /* "default" is not a policy but a request to clear this client's own. */
-    if (!in_array($mode, ['allowall', 'filtered', 'blocked', 'default'], true)) {
+    if (!in_array($mode, ['allowall', 'games', 'whitelist', 'blocked', 'default'], true)) {
         jsonOut(['success' => false, 'error' => 'Unknown client policy.']);
     }
 
@@ -220,11 +299,32 @@ if ($api === 'control_default' || $api === 'control_client') {
 }
 
 /* ---- Mutations ---- */
-if ($api === 'whitelist_save' || $api === 'whitelist_delete' || $api === 'history_approve') {
+$mutationList = [
+    'whitelist_save'   => 'whitelist',
+    'whitelist_delete' => 'whitelist',
+    'whitelist_move'   => 'whitelist',
+    'games_save'       => 'games',
+    'games_delete'     => 'games',
+    'games_move'       => 'games',
+    'history_approve'  => 'whitelist',
+    'history_games'    => 'games',
+][$api] ?? null;
+
+if ($mutationList !== null) {
     requireAdminApi();
     verifyCsrf();
 
-    if ($api === 'whitelist_save') {
+    $listWhere = $mutationList === 'games' ? 'the games list' : 'the whitelist';
+
+    if ($api === 'whitelist_move' || $api === 'games_move') {
+        $name = normalizeDomain($_POST['name'] ?? '');
+        $to   = $mutationList === 'whitelist' ? 'games' : 'whitelist';
+        [$ok, $err, $warning] = moveBetweenLists($db, $mutationList, $to, $name);
+        if (!$ok) jsonOut(['success' => false, 'error' => $err]);
+        jsonOut(['success' => true, 'name' => $err, 'note' => $warning]);
+    }
+
+    if ($api === 'whitelist_save' || $api === 'games_save') {
         $original = normalizeDomain($_POST['original'] ?? '');
         $name     = normalizeDomain($_POST['name'] ?? '');
 
@@ -241,13 +341,13 @@ if ($api === 'whitelist_save' || $api === 'whitelist_delete' || $api === 'histor
         /* The daemon matches a name through any of its parent suffixes, so an
            entry that some existing entry already covers would never be
            consulted. Checked before the rename delete below, so that a rejected
-           save leaves the table untouched. */
-        $existingSet = loadWhitelistSet($db);
+           save leaves the table untouched. Coverage is within this list only. */
+        $existingSet = loadDomainSet($db, $mutationList);
         if ($original !== '') unset($existingSet[$original]);
         $covering = isWhitelisted($name, $existingSet);
         if ($covering !== null) {
             jsonOut(['success' => false, 'error' => $covering === $name
-                ? $name . ' is already in the whitelist.'
+                ? $name . ' is already in ' . $listWhere . '.'
                 : $name . ' is already covered by ' . $covering
                     . ', which also matches every subdomain of it.']);
         }
@@ -258,20 +358,20 @@ if ($api === 'whitelist_save' || $api === 'whitelist_delete' || $api === 'histor
         $carried = false;
         if ($original !== '' && $original !== $name) {
             $prevStmt = $db->prepare(
-                'SELECT date_approved FROM whitelist WHERE name = ? COLLATE NOCASE');
+                'SELECT date_approved FROM ' . $mutationList . ' WHERE name = ? COLLATE NOCASE');
             $prevStmt->execute([$original]);
             $prevRow = $prevStmt->fetch(PDO::FETCH_ASSOC);
             $carried = $prevRow ? $prevRow['date_approved'] : false;
 
-            [$ok, $err] = applyWhitelistChange($db, 'delete', $original);
+            [$ok, $err] = applyListChange($db, $mutationList, 'delete', $original);
             if (!$ok) jsonOut(['success' => false, 'error' => $err]);
         }
-        [$ok, $err, $warning] = applyWhitelistChange($db, 'insert', $name, $carried);
+        [$ok, $err, $warning] = applyListChange($db, $mutationList, 'insert', $name, $carried);
         if (!$ok) jsonOut(['success' => false, 'error' => $err]);
 
         /* Adding a parent can strand narrower entries; report them rather than
            deleting rows the administrator did not ask to remove. */
-        $absorbed = redundantChildren($db, $name);
+        $absorbed = redundantChildren($db, $name, $mutationList);
         $note     = null;
         if (count($absorbed) === 1) {
             $note = $absorbed[0] . ' is now redundant.';
@@ -282,33 +382,33 @@ if ($api === 'whitelist_save' || $api === 'whitelist_delete' || $api === 'histor
                  'note' => joinNotes($warning, $note)]);
     }
 
-    if ($api === 'whitelist_delete') {
+    if ($api === 'whitelist_delete' || $api === 'games_delete') {
         $name = normalizeDomain($_POST['name'] ?? '');
-        [$ok, $err, $warning] = applyWhitelistChange($db, 'delete', $name);
+        [$ok, $err, $warning] = applyListChange($db, $mutationList, 'delete', $name);
         if (!$ok) jsonOut(['success' => false, 'error' => $err]);
         jsonOut(['success' => true, 'name' => $name, 'note' => $warning]);
     }
 
-    if ($api === 'history_approve') {
+    if ($api === 'history_approve' || $api === 'history_games') {
         $name = normalizeDomain($_POST['name'] ?? '');
         if (!isValidWhitelistEntry($name)) {
-            jsonOut(['success' => false, 'error' => 'Cannot approve ' . $name
+            jsonOut(['success' => false, 'error' => 'Cannot add ' . $name
                 . ': not a valid domain (needs at least two dotted labels, e.g. example.com).']);
         }
-        $covering = isWhitelisted($name, loadWhitelistSet($db));
+        $covering = isWhitelisted($name, loadDomainSet($db, $mutationList));
         if ($covering !== null) {
             jsonOut(['success' => false, 'error' => $covering === $name
-                ? $name . ' is already in the whitelist.'
+                ? $name . ' is already in ' . $listWhere . '.'
                 : $name . ' is already covered by ' . $covering
                     . ', which also matches every subdomain of it.']);
         }
-        [$ok, $err, $warning] = applyWhitelistChange($db, 'insert', $name);
+        [$ok, $err, $warning] = applyListChange($db, $mutationList, 'insert', $name);
         if (!$ok) jsonOut(['success' => false, 'error' => $err]);
 
-        /* Approving a base domain can strand narrower entries the same way a
+        /* Adding a base domain can strand narrower entries the same way a
            manual save can, so it reports them too rather than silently leaving
            rows that will never be consulted. */
-        $absorbed = redundantChildren($db, $name);
+        $absorbed = redundantChildren($db, $name, $mutationList);
         $note     = null;
         if (count($absorbed) === 1) {
             $note = $absorbed[0] . ' is now redundant.';

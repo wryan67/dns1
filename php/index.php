@@ -60,7 +60,7 @@ if (empty($_SESSION['logged_in']) && !isset($_GET['page'])) {
 requireLogin();
 
 $page = $_GET['page'] ?? 'whitelist';
-if (!in_array($page, ['whitelist', 'history', 'control'], true)) $page = 'whitelist';
+if (!in_array($page, ['whitelist', 'games', 'history', 'control'], true)) $page = 'whitelist';
 $admin = isAdmin();
 ?>
 <!DOCTYPE html>
@@ -90,16 +90,23 @@ $admin = isAdmin();
     .cmd-btn.cmd-danger:hover { color: #c0392b; }
     .cmd-btn.cmd-danger[disabled]:hover { color: #bbb; }
     .status-approved   { color: #1e8449; font-size: 1.15em; }
+    .status-games      { color: #6f42c1; font-size: 1.15em; }
     .status-unapproved { color: #c0392b; font-size: 1.15em; }
     .col-status  { width: 90px; text-align: center; }
     .col-cmd     { width: 110px; text-align: center; }
-    /* Whitelist carries a third (delete) button, so only that grid widens. */
+    /* History has three command buttons. The domain lists have four. */
     .col-cmd-w3  { width: 140px; }
+    .col-cmd-w4  { width: 176px; }
     #alertBox { position: fixed; top: 60px; right: 18px; z-index: 2000; min-width: 300px; display: none; }
     .covered-note { font-size: 0.85em; color: #777; }
     .readonly-note { margin-bottom: 12px; }
     /* Bootgrid right-aligns its action bar; these sit on the empty left side. */
     .bar-left { float: left; margin-right: 12px; }
+    /* Sits in the right-aligned action bar, immediately before the search box. */
+    .history-client {
+        display: inline-block; width: auto; max-width: 280px; height: 34px;
+        margin: 0 8px 0 0; vertical-align: middle; padding: 6px 8px;
+    }
     .filter-group .btn {
         border-color: #ccc; color: #55504d; font-weight: 600;
         transition: background-color .12s ease, color .12s ease;
@@ -136,7 +143,7 @@ $admin = isAdmin();
 
     /* Control page */
     .default-policy {
-        display: flex; justify-content: space-between; align-items: center;
+        display: flex; justify-content: space-between; align-items: center; flex-wrap: wrap; gap: 12px;
         padding: 18px 20px; border-radius: 4px; border: 1px solid #ddd; background: #fafafa;
         transition: background-color .15s ease, border-color .15s ease;
     }
@@ -146,8 +153,10 @@ $admin = isAdmin();
     .default-hint { font-size: .9em; color: #777; margin-top: 2px; }
     .default-policy.is-allowall { background: #f3faf4; border-color: #cfe8d6; }
     .default-policy.is-allowall .default-state > i { color: #2e9e4f; }
-    .default-policy.is-filtered { background: #fdfaf2; border-color: #f0e2c2; }
-    .default-policy.is-filtered .default-state > i { color: #d99400; }
+    .default-policy.is-games { background: #f7f4fb; border-color: #ddd0ee; }
+    .default-policy.is-games .default-state > i { color: #6f42c1; }
+    .default-policy.is-whitelist { background: #fdfaf2; border-color: #f0e2c2; }
+    .default-policy.is-whitelist .default-state > i { color: #d99400; }
     .default-policy.is-blocked  { background: #fdf3f2; border-color: #f0cfcb; }
     .default-policy.is-blocked  .default-state > i { color: #c0392b; }
     .default-policy.is-unknown  .default-state > i { color: #aaa; }
@@ -157,23 +166,26 @@ $admin = isAdmin();
     }
     .col-num { width: 90px; text-align: right; }
     #clientGrid td.col-num { text-align: right; }
-    .client-blocked  td { background: #fdf3f2 !important; }
-    .client-allowall td { background: #f3faf4 !important; }
+    .client-blocked   td { background: #fdf3f2 !important; }
+    .client-allowall  td { background: #f3faf4 !important; }
+    .client-games     td { background: #f7f4fb !important; }
+    .client-whitelist td { background: #fdfaf2 !important; }
 
     /* Policy picker: side-by-side buttons, current one raised. The states are
        told apart by colour, so each icon carries a text label. */
-    .mode-allowall { color: #2e9e4f; }
-    .mode-filtered { color: #d99400; }
-    .mode-blocked  { color: #cc3b33; }
-    .mode-default  { color: #4a7fb5; }
-    .mode-inactive { color: #b6bcc2; }
+    .mode-allowall  { color: #2e9e4f; }
+    .mode-games     { color: #6f42c1; }
+    .mode-whitelist { color: #d99400; }
+    .mode-blocked   { color: #cc3b33; }
+    .mode-default   { color: #4a7fb5; }
+    .mode-inactive  { color: #b6bcc2; }
 
-    .col-policy { width: 340px; }
+    .col-policy { width: 520px; }
     /* Bottom padding leaves room for the active button to lift without the row
        growing and shifting every other row on the page. */
     #clientGrid td.col-policy { padding-top: 8px; padding-bottom: 4px; }
 
-    .policy-group { display: inline-flex; align-items: flex-end; gap: 3px; }
+    .policy-group { display: inline-flex; align-items: flex-end; flex-wrap: wrap; gap: 3px; }
     .policy-btn {
         display: inline-flex; align-items: center; gap: 5px;
         padding: 3px 8px; font-size: 12px; line-height: 1.4;
@@ -189,10 +201,11 @@ $admin = isAdmin();
         transform: translateY(-3px);
         box-shadow: 0 3px 5px -1px rgba(0,0,0,.22);
     }
-    .policy-btn.is-active.mode-allowall { border-color: #2e9e4f; }
-    .policy-btn.is-active.mode-filtered { border-color: #d99400; }
-    .policy-btn.is-active.mode-blocked  { border-color: #cc3b33; }
-    .policy-btn.is-active.mode-default  { border-color: #4a7fb5; }
+    .policy-btn.is-active.mode-allowall  { border-color: #2e9e4f; }
+    .policy-btn.is-active.mode-games     { border-color: #6f42c1; }
+    .policy-btn.is-active.mode-whitelist { border-color: #d99400; }
+    .policy-btn.is-active.mode-blocked   { border-color: #cc3b33; }
+    .policy-btn.is-active.mode-default   { border-color: #4a7fb5; }
     /* The icon keeps its own state colour; only the label follows the button. */
     .policy-btn.is-active > span { color: #333; }
 
@@ -216,6 +229,8 @@ $admin = isAdmin();
       <ul class="nav navbar-nav">
         <li class="<?= $page === 'whitelist' ? 'active' : '' ?>">
           <a href="index.php?page=whitelist"><i class="fa-solid fa-shield-halved"></i> Whitelist</a></li>
+        <li class="<?= $page === 'games' ? 'active' : '' ?>">
+          <a href="index.php?page=games"><i class="fa-solid fa-gamepad"></i> Games</a></li>
         <li class="<?= $page === 'history' ? 'active' : '' ?>">
           <a href="index.php?page=history"><i class="fa-solid fa-clock-rotate-left"></i> History</a></li>
         <li class="<?= $page === 'control' ? 'active' : '' ?>">
@@ -262,8 +277,31 @@ $admin = isAdmin();
             <th data-column-id="date_approved" data-formatter="ts" data-sortable="true"
                 data-searchable="false" data-width="30%">Approved</th>
             <th data-column-id="commands" data-formatter="commands" data-sortable="false"
-                data-searchable="false" data-css-class="col-cmd col-cmd-w3"
-                data-header-css-class="col-cmd col-cmd-w3">Commands</th>
+                data-searchable="false" data-css-class="col-cmd col-cmd-w4"
+                data-header-css-class="col-cmd col-cmd-w4">Commands</th>
+          </tr>
+        </thead>
+      </table>
+    </div>
+  </div>
+
+<?php elseif ($page === 'games'): ?>
+  <div class="panel panel-default panel-dns">
+    <div class="panel-heading" style="display:flex;justify-content:space-between;align-items:center;">
+      <h3 class="page-title">Games</h3>
+      <button id="autoRefreshBtn" class="btn btn-sm btn-danger" onclick="toggleAutoRefresh()">
+        <i class="fa-solid fa-gem"></i> Auto refresh</button>
+    </div>
+    <div class="panel-body">
+      <table id="gamesGrid" class="table table-condensed table-hover table-striped">
+        <thead>
+          <tr>
+            <th data-column-id="name" data-sortable="true" data-order="asc" data-width="55%">Name</th>
+            <th data-column-id="date_approved" data-formatter="ts" data-sortable="true"
+                data-searchable="false" data-width="30%">Approved</th>
+            <th data-column-id="commands" data-formatter="commands" data-sortable="false"
+                data-searchable="false" data-css-class="col-cmd col-cmd-w4"
+                data-header-css-class="col-cmd col-cmd-w4">Commands</th>
           </tr>
         </thead>
       </table>
@@ -283,8 +321,10 @@ $admin = isAdmin();
           <tr>
             <th data-column-id="approved" data-formatter="status" data-sortable="false"
                 data-searchable="false" data-css-class="col-status" data-header-css-class="col-status">Status</th>
-            <th data-column-id="name" data-sortable="true" data-width="52%"
+            <th data-column-id="name" data-sortable="true" data-width="40%"
                 data-css-class="col-name" data-header-css-class="col-name">Name</th>
+            <th data-column-id="client_ip" data-formatter="client" data-sortable="true"
+                data-searchable="false" data-width="180px">Client</th>
             <th data-column-id="total_count" data-sortable="true" data-searchable="false"
                 data-width="80" data-align="right" data-header-align="right">Count</th>
             <th data-column-id="last_any" data-sortable="true" data-searchable="false"
@@ -298,7 +338,8 @@ $admin = isAdmin();
             <th data-column-id="allowed_last_seen" data-sortable="true" data-searchable="false"
                 data-formatter="ts" data-visible="false">Last Allowed</th>
             <th data-column-id="commands" data-formatter="commands" data-sortable="false"
-                data-searchable="false" data-css-class="col-cmd" data-header-css-class="col-cmd">Commands</th>
+                data-searchable="false" data-css-class="col-cmd col-cmd-w3"
+                data-header-css-class="col-cmd col-cmd-w3">Commands</th>
           </tr>
         </thead>
       </table>
@@ -343,7 +384,7 @@ $admin = isAdmin();
             <th data-column-id="hostname" data-formatter="hostname" data-sortable="true"
                 data-width="24%">Machine name</th>
             <th data-column-id="mode" data-formatter="clientMode" data-sortable="true"
-                data-searchable="false" data-width="340px"
+                data-searchable="false" data-width="520px"
                 data-css-class="col-policy" data-header-css-class="col-policy">Policy</th>
             <th data-column-id="query_count" data-sortable="true" data-searchable="false"
                 data-css-class="col-num" data-header-css-class="col-num">Queries</th>
@@ -394,20 +435,20 @@ $admin = isAdmin();
           <div class="radio scope-row">
             <label>
               <input type="radio" name="allowScope" value="exact" checked>
-              Allow exact domain <code id="scopeExactText"></code>
+              <span class="scope-verb">Allow</span> exact domain <code id="scopeExactText"></code>
             </label>
           </div>
           <div class="radio scope-row" id="scopeBaseRow">
             <label>
               <input type="radio" name="allowScope" value="base">
-              Allow base domain <code id="scopeBaseText"></code>
+              <span class="scope-verb">Allow</span> base domain <code id="scopeBaseText"></code>
             </label>
             <span class="scope-hint">also allows every subdomain of it</span>
           </div>
           <div class="radio scope-row">
             <label>
               <input type="radio" name="allowScope" value="custom">
-              Allow custom
+              <span class="scope-verb">Allow</span> custom
             </label>
             <input type="text" class="form-control scope-custom" id="scopeCustomText"
                    spellcheck="false" autocomplete="off" disabled>
@@ -510,10 +551,12 @@ function notify(msg, type) {
     window._alertTimer = setTimeout(function () { $('#alertBox').fadeOut(300); }, 4000);
 }
 
-/* Which History rows to show: all, blocked (not whitelisted) or allowed. */
+/* Which History rows to show: all, blocked (on neither list), or allowed.
+   historyClient is empty for every client, or one IP from the dropdown. */
 var historyFilter = 'all';
+var historyClient = '';
 
-/* The three policies, in increasing order of strictness, plus the "default"
+/* The policies, in increasing order of strictness, plus the "default"
    pseudo-policy a client uses to say it has none of its own. Kept in one place
    so the icon, the colour and the label cannot drift apart. */
 var CLIENT_MODES = {
@@ -527,26 +570,32 @@ var CLIENT_MODES = {
         label: 'Allow all',
         icon:  'fa-shield',
         cls:   'mode-allowall',
-        hint:  'Allow all: every name resolves, whitelist ignored.'
+        hint:  'Allow all: every name resolves, both lists ignored.'
     },
-    filtered: {
-        label: 'Filtered',
+    games: {
+        label: 'Games',
+        icon:  'fa-gamepad',
+        cls:   'mode-games',
+        hint:  'Games: whitelisted names and games names resolve.'
+    },
+    whitelist: {
+        label: 'Whitelist',
         icon:  'fa-shield-halved',
-        cls:   'mode-filtered',
-        hint:  'Filtered: only whitelisted names resolve.'
+        cls:   'mode-whitelist',
+        hint:  'Whitelist: only whitelisted names resolve.'
     },
     blocked: {
         label: 'Block all',
         icon:  'fa-shield',
         cls:   'mode-blocked',
-        hint:  'Block all: every query is refused, whitelisted names included.'
+        hint:  'Block all: every query is refused, listed names included.'
     }
 };
 
 /* Fixed order for the pickers, strictest last. A client can also inherit, so it
    gets the extra button; the default itself has nothing to inherit from. */
-var CLIENT_MODE_ORDER  = ['default', 'allowall', 'filtered', 'blocked'];
-var DEFAULT_MODE_ORDER = ['allowall', 'filtered', 'blocked'];
+var CLIENT_MODE_ORDER  = ['default', 'allowall', 'games', 'whitelist', 'blocked'];
+var DEFAULT_MODE_ORDER = ['allowall', 'games', 'whitelist', 'blocked'];
 
 /* The default in force, as last reported by the daemon. Null until the first
    reply arrives, or if the daemon cannot be reached. Held here because an
@@ -608,7 +657,10 @@ var gridOptions = {
     ajax: true,
     post: function () {
         var p = { csrf_token: CSRF };
-        if (PAGE === 'history') { p.status = historyFilter; }
+        if (PAGE === 'history') {
+            p.status = historyFilter;
+            if (historyClient) p.client = historyClient;
+        }
         return p;
     },
     selection: false,
@@ -619,18 +671,30 @@ var gridOptions = {
             var copy = '<button class="cmd-btn js-copy" title="Copy domain to clipboard"' +
                        ' data-name="' + esc(row.name) + '">' +
                        '<i class="fa-regular fa-clipboard"></i></button>';
-            if (PAGE === 'whitelist') {
+            if (PAGE === 'whitelist' || PAGE === 'games') {
+                var listName = PAGE === 'games' ? 'games list' : 'whitelist';
+                var move = PAGE === 'whitelist'
+                    ? '<button class="cmd-btn js-move" title="Move to Games" data-name="' + esc(row.name) + '"' +
+                      (IS_ADMIN ? '' : ' disabled') +
+                      '><i class="fa-solid fa-gamepad"></i></button>'
+                    : '<button class="cmd-btn js-move" title="Move to Whitelist" data-name="' + esc(row.name) + '"' +
+                      (IS_ADMIN ? '' : ' disabled') +
+                      '><i class="fa-solid fa-shield-halved"></i></button>';
                 return '<button class="cmd-btn js-edit" title="Edit" data-name="' + esc(row.name) + '"' +
                        (IS_ADMIN ? '' : ' disabled') +
-                       '><i class="fa-regular fa-pen-to-square"></i></button>' + copy +
+                       '><i class="fa-regular fa-pen-to-square"></i></button>' + copy + move +
                        '<button class="cmd-btn cmd-danger js-delete"' +
-                       ' title="Remove from whitelist" data-name="' + esc(row.name) + '"' +
+                       ' title="Remove from ' + listName + '" data-name="' + esc(row.name) + '"' +
                        (IS_ADMIN ? '' : ' disabled') +
                        '><i class="fa-regular fa-trash-can"></i></button>';
             }
+            var gamesDisabled = !IS_ADMIN || row.on_games || row.local;
             return '<button class="cmd-btn js-approve" title="Approve" data-name="' + esc(row.name) + '"' +
                    (IS_ADMIN && !row.approved ? '' : ' disabled') +
-                   '><i class="fa-solid fa-check-to-slot"></i></button>' + copy;
+                   '><i class="fa-solid fa-check-to-slot"></i></button>' +
+                   '<button class="cmd-btn js-games" title="Add to Games" data-name="' + esc(row.name) + '"' +
+                   (gamesDisabled ? ' disabled' : '') +
+                   '><i class="fa-solid fa-gamepad"></i></button>' + copy;
         },
         /* Four buttons: the client's own policy, or "Default" to follow the
            network-wide one. */
@@ -654,15 +718,29 @@ var gridOptions = {
                    ' data-name="' + esc(row.ip) + '">' +
                    '<i class="fa-regular fa-clipboard"></i></button>';
         },
+        client: function (column, row) {
+            if (!row.client_ip) {
+                return '<span class="hostname-unknown">unknown</span>';
+            }
+            return esc(row.client_ip);
+        },
         status: function (column, row) {
-            if (row.approved) {
+            if (row.on_whitelist) {
                 var t = 'Approved';
-                if (row.local) {
-                    t = 'Allowed: local network name';
-                } else if (row.covered_by && row.covered_by !== row.name) {
+                if (row.covered_by && row.covered_by !== row.name) {
                     t = 'Approved via ' + row.covered_by;
                 }
                 return '<i class="fa-solid fa-circle-check status-approved" title="' + esc(t) + '"></i>';
+            }
+            if (row.local) {
+                return '<i class="fa-solid fa-circle-check status-approved" title="Allowed: local network name"></i>';
+            }
+            if (row.on_games) {
+                var g = 'Games';
+                if (row.games_by && row.games_by !== row.name) {
+                    g = 'Games via ' + row.games_by;
+                }
+                return '<i class="fa-solid fa-gamepad status-games" title="' + esc(g) + '"></i>';
             }
             return '<i class="fa-solid fa-circle-minus status-unapproved" title="Unapproved"></i>';
         },
@@ -681,9 +759,11 @@ var gridOptions = {
 };
 
 $(function () {
-    if (PAGE === 'whitelist') {
-        grid = $('#whitelistGrid').bootgrid($.extend({}, gridOptions, {
-            url: 'index.php?api=whitelist_data'
+    if (PAGE === 'whitelist' || PAGE === 'games') {
+        var gridSel = PAGE === 'games' ? '#gamesGrid' : '#whitelistGrid';
+        var dataApi = PAGE === 'games' ? 'games_data' : 'whitelist_data';
+        grid = $(gridSel).bootgrid($.extend({}, gridOptions, {
+            url: 'index.php?api=' + dataApi
         })).on('loaded.rs.jquery.bootgrid', function () {
             injectAddDomainButton();
             grid.find('.js-edit').off('click').on('click', function () {
@@ -691,6 +771,9 @@ $(function () {
             });
             grid.find('.js-delete').off('click').on('click', function () {
                 removeDomain($(this).data('name'));
+            });
+            grid.find('.js-move').off('click').on('click', function () {
+                moveDomain($(this).data('name'));
             });
             bindCopyButtons();
         });
@@ -717,12 +800,16 @@ $(function () {
             url: 'index.php?api=history_data'
         })).on('loaded.rs.jquery.bootgrid', function () {
             injectHistoryFilter();
+            injectHistoryClient();
             applyHistoryHeadings();
             /* Approve opens the same dialog as a double-click, so the allow
                scope can be chosen there rather than being implicitly the exact
                name. */
             grid.find('.js-approve').off('click').on('click', function () {
-                openDetailForRow($(this));
+                openDetailForRow($(this), 'whitelist');
+            });
+            grid.find('.js-games').off('click').on('click', function () {
+                openDetailForRow($(this), 'games');
             });
             bindCopyButtons();
         });
@@ -732,7 +819,7 @@ $(function () {
            object comes from getCurrentRows() by position instead of being
            embedded in attributes. */
         grid.on('dblclick', 'td.col-name', function () {
-            openDetailForRow($(this));
+            openDetailForRow($(this), 'whitelist');
         });
 
         $('#detailAction').on('click', applyDetailAction);
@@ -771,8 +858,8 @@ function markClientRows() {
     var rows = grid.bootgrid('getCurrentRows') || [];
     grid.find('tbody > tr').each(function (i) {
         var mode = effectiveMode(rows[i]);
-        $(this).removeClass('client-allowall client-blocked')
-               .addClass(mode && mode !== 'filtered' ? 'client-' + mode : '');
+        $(this).removeClass('client-allowall client-games client-whitelist client-blocked')
+               .addClass(mode ? 'client-' + mode : '');
     });
 }
 
@@ -791,7 +878,7 @@ function renderDefaultPolicy(mode) {
     DEFAULT_POLICY = mode;
 
     var $box = $('#defaultPolicy');
-    $box.removeClass('is-allowall is-filtered is-blocked is-unknown');
+    $box.removeClass('is-allowall is-games is-whitelist is-blocked is-unknown');
 
     if (mode === null) {
         $box.addClass('is-unknown');
@@ -801,9 +888,10 @@ function renderDefaultPolicy(mode) {
         $('#defaultPicker').empty();
     } else {
         var HINTS = {
-            allowall: 'Every name resolves for these clients; the whitelist is ignored.',
-            filtered: 'Only whitelisted names resolve. This is the normal running state.',
-            blocked:  'Every query is refused, including whitelisted names.'
+            allowall:  'Every name resolves for these clients; both lists are ignored.',
+            games:     'Whitelisted names and games names resolve.',
+            whitelist: 'Only whitelisted names resolve.',
+            blocked:   'Every query is refused, including listed names.'
         };
         $box.addClass('is-' + mode);
         $('#defaultIcon').attr('class', 'fa-solid ' + CLIENT_MODES[mode].icon);
@@ -858,17 +946,18 @@ function setClientMode($group, ip, mode) {
     });
 }
 
-function openDetailForRow($el) {
+function openDetailForRow($el, dest) {
     var rows = grid.bootgrid('getCurrentRows');
     var idx  = $el.closest('tr').index();
-    if (rows && rows[idx]) openDetail(rows[idx]);
+    if (rows && rows[idx]) openDetail(rows[idx], dest);
 }
 
 /* Bootgrid owns the markup above the table, so the Add Domain button is
    injected into its action bar once the grid has rendered. */
 function injectAddDomainButton() {
     if (!IS_ADMIN) return;
-    var $bar = $('#whitelistGrid').closest('.panel-body').find('.bootgrid-header .actionBar');
+    var gridSel = PAGE === 'games' ? '#gamesGrid' : '#whitelistGrid';
+    var $bar = $(gridSel).closest('.panel-body').find('.bootgrid-header .actionBar');
     if (!$bar.length || $bar.find('#addDomainBtn').length) return;
     $('<button/>', {
         id: 'addDomainBtn',
@@ -939,6 +1028,54 @@ function injectHistoryFilter() {
     $bar.prepend($group);
 }
 
+/* Immediately left of the search box. The action bar is right-aligned and the
+ * search field is inline, so inserting the select just before it places the
+ * control on its left. Hidden until the daemon has added client_ip. */
+function injectHistoryClient() {
+    var $bar = $('#historyGrid').closest('.panel-body').find('.bootgrid-header .actionBar');
+    var $search = $bar.find('.search');
+    if (!$bar.length || !$search.length) return;
+
+    var $sel = $bar.find('#historyClient');
+    if (!$sel.length) {
+        $sel = $('<select/>', {
+            id: 'historyClient',
+            'class': 'form-control history-client',
+            title: 'Show history for one client'
+        });
+        $search.before($sel);
+        $sel.on('change', function () {
+            var value = $(this).val() || '';
+            if (value === historyClient) return;
+            historyClient = value;
+            grid.bootgrid('reload');
+        });
+    }
+
+    $.post('index.php?api=history_clients', { csrf_token: CSRF }, null, 'json')
+        .done(function (res) {
+            if (!res || !res.ready) {
+                $sel.remove();
+                return;
+            }
+            var current = historyClient;
+            $sel.empty().append($('<option/>', { value: '', text: 'All clients' }));
+            $.each(res.clients || [], function (i, c) {
+                var label = c.ip;
+                if (c.hostname) {
+                    var short = String(c.hostname).split('.')[0];
+                    label = c.ip + ' (' + (short || c.hostname) + ')';
+                }
+                $sel.append($('<option/>', { value: c.ip, text: label }));
+            });
+            $sel.val(current);
+            if ($sel.val() !== current) {
+                $sel.val('');
+                historyClient = '';
+            }
+        });
+}
+
 /* Auto refresh: green button while running, red while stopped. */
 var AUTO_REFRESH_MS = 3000;
 var autoTimer = null;
@@ -996,10 +1133,18 @@ function apiPost(action, data, onOk, onErr) {
         });
 }
 
+function listApi(action) {
+    return (PAGE === 'games' ? 'games' : 'whitelist') + '_' + action;
+}
+
+function listNoun() {
+    return PAGE === 'games' ? 'the games list' : 'the whitelist';
+}
+
 function saveEntry() {
     var name = $.trim($('#editName').val());
     if (!name) { $('#editError').text('Please enter a domain name.').show(); return; }
-    apiPost('whitelist_save', { original: editOriginal, name: name }, function (res) {
+    apiPost(listApi('save'), { original: editOriginal, name: name }, function (res) {
         $('#editModal').modal('hide');
         notify('Saved ' + res.name + (res.note ? ' \u2014 ' + res.note : ''), 'success');
         grid.bootgrid('reload');
@@ -1066,14 +1211,30 @@ $(function () {
 function removeDomain(name, onCancel) {
     confirmDialog({
         title: 'Remove domain',
-        body: 'Remove "' + name + '" from the whitelist?',
+        body: 'Remove "' + name + '" from ' + listNoun() + '?',
         okText: 'Remove',
         danger: true
     }, function (ok) {
         if (!ok) { if (onCancel) onCancel(); return; }
-        apiPost('whitelist_delete', { name: name }, function (res) {
+        apiPost(listApi('delete'), { name: name }, function (res) {
             notify('Removed ' + res.name + (res.note ? ' \u2014 ' + res.note : ''),
                    res.note ? 'danger' : 'success');
+            grid.bootgrid('reload');
+        });
+    });
+}
+
+function moveDomain(name) {
+    var toGames = PAGE === 'whitelist';
+    confirmDialog({
+        title: toGames ? 'Move to Games' : 'Move to Whitelist',
+        body: 'Move "' + name + '" to ' + (toGames ? 'the games list' : 'the whitelist') + '?',
+        okText: 'Move'
+    }, function (ok) {
+        if (!ok) return;
+        apiPost(listApi('move'), { name: name }, function (res) {
+            notify('Moved ' + res.name + (res.note ? ' \u2014 ' + res.note : ''),
+                   res.note ? 'info' : 'success');
             grid.bootgrid('reload');
         });
     });
@@ -1123,8 +1284,22 @@ function selectedScopeName(exact) {
     return exact;
 }
 
-function openDetail(row) {
+function showAllowScope(row, verb) {
+    $('.scope-verb').text(verb);
+    var base = baseDomain(row.name);
+    $('#scopeExactText').text(row.name);
+    $('#scopeBaseText').text(base);
+    $('#scopeCustomText').val(row.name).prop('disabled', true);
+    /* With two labels the base is the name itself, so offering both would
+       be two radios that do the same thing. */
+    $('#scopeBaseRow').toggle(base !== '' && base !== row.name);
+    $('input[name="allowScope"][value="exact"]').prop('checked', true);
+    $('#detailScope').show();
+}
+
+function openDetail(row, dest) {
     if (!row || !row.name) return;
+    dest = dest || 'whitelist';
     var $act   = $('#detailAction');
     var $note  = $('#detailNote');
     var $scope = $('#detailScope');
@@ -1133,23 +1308,34 @@ function openDetail(row) {
     $note.hide().empty();
     $scope.hide();
     detailTarget = null;
+    $('.scope-verb').text('Allow');
 
-    if (!row.approved) {
-        $('#detailStatus').html('<i class="fa-solid fa-circle-minus status-unapproved"></i>' +
-            'Currently <strong>blocked</strong>.');
-
-        var base = baseDomain(row.name);
-        $('#scopeExactText').text(row.name);
-        $('#scopeBaseText').text(base);
-        $('#scopeCustomText').val(row.name).prop('disabled', true);
-        /* With two labels the base is the name itself, so offering both would
-           be two radios that do the same thing. */
-        $('#scopeBaseRow').toggle(base !== '' && base !== row.name);
-        $('input[name="allowScope"][value="exact"]').prop('checked', true);
-
-        $scope.show();
-        detailTarget = { op: 'allow', name: row.name };
-        $act.text('Allow').removeClass('btn-danger').addClass('btn-success');
+    if (dest === 'games') {
+        if (row.local) {
+            $('#detailStatus').html('<i class="fa-solid fa-circle-check status-approved"></i>' +
+                'Currently <strong>allowed</strong> as a local network name.');
+            $note.html('Single-label names are always allowed and are not added to the games list.').show();
+        } else if (row.on_games) {
+            var gvia = row.games_by && row.games_by !== row.name;
+            $('#detailStatus').html('<i class="fa-solid fa-gamepad status-games"></i>' +
+                'Already on the <strong>games list</strong>' +
+                (gvia ? ' via <code>' + esc(row.games_by) + '</code>' : '') + '.');
+        } else {
+            if (row.on_whitelist) {
+                var wvia = row.covered_by && row.covered_by !== row.name;
+                $('#detailStatus').html('<i class="fa-solid fa-circle-check status-approved"></i>' +
+                    'Currently on the <strong>whitelist</strong>' +
+                    (wvia ? ' via <code>' + esc(row.covered_by) + '</code>' : '') + '.');
+                $note.html('This adds a games entry and leaves the whitelist row in place.').show();
+            } else {
+                $('#detailStatus').html('<i class="fa-solid fa-circle-minus status-unapproved"></i>' +
+                    'Currently <strong>blocked</strong>.');
+                $note.html('This adds the name to the games list only.').show();
+            }
+            showAllowScope(row, 'Add');
+            detailTarget = { op: 'games', name: row.name };
+            $act.text('Add to Games').removeClass('btn-danger').addClass('btn-success');
+        }
     } else if (row.local) {
         /* Allowed as a class by the resolver, so there is no whitelist row to
            remove and the action button would have nothing to act on. */
@@ -1157,7 +1343,7 @@ function openDetail(row) {
             'Currently <strong>allowed</strong> as a local network name.');
         $note.html('Single-label names are always allowed and have no whitelist ' +
                    'entry to remove.').show();
-    } else {
+    } else if (row.on_whitelist) {
         var via = row.covered_by && row.covered_by !== row.name;
         $('#detailStatus').html('<i class="fa-solid fa-circle-check status-approved"></i>' +
             'Currently <strong>allowed</strong>' +
@@ -1166,10 +1352,29 @@ function openDetail(row) {
            for a subdomain match is the parent rather than this name. */
         detailTarget = { op: 'block', name: row.covered_by || row.name };
         $act.text('Block').removeClass('btn-success').addClass('btn-danger');
+        var blockNote = '';
         if (via) {
-            $note.html('Blocking removes <code>' + esc(row.covered_by) + '</code> from the ' +
-                       'whitelist, which also blocks every other subdomain of it.').show();
+            blockNote = 'Blocking removes <code>' + esc(row.covered_by) + '</code> from the ' +
+                        'whitelist, which also blocks every other subdomain of it.';
         }
+        if (row.on_games) {
+            blockNote += (blockNote ? ' ' : '') + 'The games entry is left in place.';
+        }
+        if (blockNote) $note.html(blockNote).show();
+    } else {
+        if (row.on_games) {
+            var viaGames = row.games_by && row.games_by !== row.name;
+            $('#detailStatus').html('<i class="fa-solid fa-gamepad status-games"></i>' +
+                'Currently on the <strong>games list</strong>' +
+                (viaGames ? ' via <code>' + esc(row.games_by) + '</code>' : '') + '.');
+            $note.html('Adding it to the whitelist leaves the games entry in place.').show();
+        } else {
+            $('#detailStatus').html('<i class="fa-solid fa-circle-minus status-unapproved"></i>' +
+                'Currently <strong>blocked</strong>.');
+        }
+        showAllowScope(row, 'Allow');
+        detailTarget = { op: 'allow', name: row.name };
+        $act.text('Allow').removeClass('btn-danger').addClass('btn-success');
     }
 
     $act.toggle(!!detailTarget && IS_ADMIN);
@@ -1179,7 +1384,8 @@ function openDetail(row) {
 function applyDetailAction() {
     if (!detailTarget || !IS_ADMIN) return;
     var op   = detailTarget.op;
-    var name = op === 'allow' ? selectedScopeName(detailTarget.name) : detailTarget.name;
+    var name = (op === 'allow' || op === 'games')
+        ? selectedScopeName(detailTarget.name) : detailTarget.name;
 
     if (!name) {
         notify('Enter a domain to allow.', 'danger');
@@ -1192,6 +1398,11 @@ function applyDetailAction() {
     if (op === 'allow') {
         apiPost('history_approve', { name: name }, function (res) {
             notify('Allowed ' + res.name + (res.note ? ' \u2014 ' + res.note : ''), 'success');
+            grid.bootgrid('reload');
+        });
+    } else if (op === 'games') {
+        apiPost('history_games', { name: name }, function (res) {
+            notify('Added ' + res.name + ' to games' + (res.note ? ' \u2014 ' + res.note : ''), 'success');
             grid.bootgrid('reload');
         });
     } else {
