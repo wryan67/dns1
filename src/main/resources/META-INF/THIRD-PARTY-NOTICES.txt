@@ -1,0 +1,45 @@
+THIRD-PARTY SOFTWARE NOTICES
+============================
+
+This product bundles the following third-party components. Full license
+texts are included in META-INF/licenses/ inside the distributed JAR.
+
+------------------------------------------------------------------------
+dnsjava
+  Coordinates : dnsjava:dnsjava:3.6.5
+  Homepage    : https://github.com/dnsjava/dnsjava
+  License     : BSD 3-Clause
+  License text: META-INF/licenses/LICENSE-dnsjava.txt
+  Copyright   : (c) 1998-2019 Brian Wellington
+                (c) 2005 VeriSign, Inc.
+                (c) 2019-2023 dnsjava authors
+
+------------------------------------------------------------------------
+SQLite JDBC Driver
+  Coordinates : org.xerial:sqlite-jdbc:3.53.4.0
+  Homepage    : https://github.com/xerial/sqlite-jdbc
+  License     : Apache License 2.0
+  License text: META-INF/licenses/LICENSE-sqlite-jdbc.txt
+
+  Includes code derived from the Zentus SQLiteJDBC driver, which is
+  distributed under the BSD 2-Clause license.
+  License text: META-INF/licenses/LICENSE-sqlite-jdbc-zentus.txt
+  Copyright   : (c) 2006 David Crawshaw
+
+  The bundled native SQLite library is in the public domain.
+
+------------------------------------------------------------------------
+SLF4J API
+  Coordinates : org.slf4j:slf4j-api:1.7.36
+  Homepage    : https://www.slf4j.org/
+  License     : MIT
+  License text: META-INF/licenses/LICENSE-slf4j.txt
+  Copyright   : (c) 2004-2025 QOS.ch
+
+------------------------------------------------------------------------
+SLF4J Simple Binding
+  Coordinates : org.slf4j:slf4j-simple:1.7.36
+  Homepage    : https://www.slf4j.org/
+  License     : MIT
+  License text: META-INF/licenses/LICENSE-slf4j.txt
+  Copyright   : (c) 2004-2025 QOS.ch
