@@ -107,6 +107,12 @@ $admin = isAdmin();
         display: inline-block; width: auto; max-width: 280px; height: 34px;
         margin: 0 8px 0 0; vertical-align: middle; padding: 6px 8px;
     }
+    .history-legend {
+        margin-top: 4px; padding-top: 10px; border-top: 1px solid #e5e5e5;
+        color: #666; font-size: .92em;
+    }
+    .history-legend span { display: inline-block; margin: 0 18px 4px 0; white-space: nowrap; }
+    .history-legend i { margin-right: 6px; }
     .filter-group .btn {
         border-color: #ccc; color: #55504d; font-weight: 600;
         transition: background-color .12s ease, color .12s ease;
@@ -343,6 +349,12 @@ $admin = isAdmin();
           </tr>
         </thead>
       </table>
+      <div class="history-legend">
+        <span><i class="fa-solid fa-circle-check status-approved"></i> Whitelist — on the whitelist, including by a parent domain</span>
+        <span><i class="fa-solid fa-circle-check status-approved"></i> Local name — a single-label name, always allowed</span>
+        <span><i class="fa-solid fa-gamepad status-games"></i> Games — on the games list and not the whitelist, including by a parent domain</span>
+        <span><i class="fa-solid fa-circle-minus status-unapproved"></i> Unapproved — on neither list</span>
+      </div>
     </div>
   </div>
 <?php elseif ($page === 'control'): ?>
