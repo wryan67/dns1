@@ -92,7 +92,8 @@ $admin = isAdmin();
     .status-approved   { color: #1e8449; font-size: 1.15em; }
     .status-games      { color: #6f42c1; font-size: 1.15em; }
     .status-unapproved { color: #c0392b; font-size: 1.15em; }
-    .col-status  { width: 90px; text-align: center; }
+    .col-status  { width: 110px; text-align: center; white-space: nowrap; }
+    .col-status i + i { margin-left: 5px; }
     .col-cmd     { width: 110px; text-align: center; }
     /* History has three command buttons. The domain lists have four. */
     .col-cmd-w3  { width: 140px; }
@@ -352,7 +353,8 @@ $admin = isAdmin();
       <div class="history-legend">
         <span><i class="fa-solid fa-circle-check status-approved"></i> Whitelist — on the whitelist, including by a parent domain</span>
         <span><i class="fa-solid fa-circle-check status-approved"></i> Local name — a single-label name, always allowed</span>
-        <span><i class="fa-solid fa-gamepad status-games"></i> Games — on the games list and not the whitelist, including by a parent domain</span>
+        <span><i class="fa-solid fa-gamepad status-games"></i><i class="fa-solid fa-circle-check status-approved"></i> Games, allowed for this client</span>
+        <span><i class="fa-solid fa-gamepad status-games"></i><i class="fa-solid fa-circle-minus status-unapproved"></i> Games, blocked for this client</span>
         <span><i class="fa-solid fa-circle-minus status-unapproved"></i> Unapproved — on neither list</span>
       </div>
     </div>
@@ -438,7 +440,7 @@ $admin = isAdmin();
     <div class="modal-content">
       <div class="modal-header">
         <button type="button" class="close" data-dismiss="modal">&times;</button>
-        <h4 class="modal-title">Domain</h4>
+        <h4 class="modal-title" id="detailTitle">Domain</h4>
       </div>
       <div class="modal-body">
         <div class="domain-full" id="detailName"></div>
@@ -476,7 +478,7 @@ $admin = isAdmin();
   </div>
 </div>
 
-<!-- Edit / add whitelist entry -->
+<!-- Edit / add whitelist or games entry -->
 <div class="modal fade" id="editModal" tabindex="-1">
   <div class="modal-dialog modal-sm">
     <div class="modal-content">
@@ -486,10 +488,33 @@ $admin = isAdmin();
       </div>
       <div class="modal-body">
         <div class="form-group">
-          <label for="editName">Domain name</label>
+          <label for="editName" id="editNameLabel">Domain name</label>
           <input type="text" class="form-control" id="editName" placeholder="example.com" autocomplete="off">
-          <p class="help-block">Matches the domain and every subdomain of it.
+          <p class="help-block" id="editHelp">Matches the domain and every subdomain of it.
              Must have at least two labels, using letters, digits, hyphen or underscore.</p>
+        </div>
+        <div id="editScope" style="display:none;">
+          <div class="radio scope-row">
+            <label>
+              <input type="radio" name="editScope" value="exact" checked>
+              Add exact domain <code id="editExactText"></code>
+            </label>
+          </div>
+          <div class="radio scope-row" id="editBaseRow">
+            <label>
+              <input type="radio" name="editScope" value="base">
+              Add base domain <code id="editBaseText"></code>
+            </label>
+            <span class="scope-hint">also allows every subdomain of it</span>
+          </div>
+          <div class="radio scope-row">
+            <label>
+              <input type="radio" name="editScope" value="custom">
+              Add custom
+            </label>
+            <input type="text" class="form-control scope-custom" id="editCustomText"
+                   spellcheck="false" autocomplete="off" disabled>
+          </div>
         </div>
         <div id="editError" class="text-danger" style="display:none;"></div>
       </div>
@@ -497,7 +522,7 @@ $admin = isAdmin();
         <button type="button" class="btn btn-link text-danger" id="deleteBtn" onclick="deleteEntry()"
                 style="float:left;"><i class="fa-regular fa-trash-can"></i> Delete</button>
         <button type="button" class="btn btn-default" data-dismiss="modal">Cancel</button>
-        <button type="button" class="btn btn-primary" onclick="saveEntry()">Save</button>
+        <button type="button" class="btn btn-primary" id="editSaveBtn" onclick="saveEntry()">Save</button>
       </div>
     </div>
   </div>
@@ -512,6 +537,9 @@ var IS_ADMIN = <?= $admin ? 'true' : 'false' ?>;
 var PAGE     = <?= json_encode($page) ?>;
 var grid     = null;
 var editOriginal = '';
+/* Hostname last parsed out of the add field, so a URL edit can refresh the
+   custom box without wiping a name the user has already changed. */
+var editParsedHost = '';
 
 /* Escapes for both text and attribute contexts. innerHTML leaves quotes alone,
    so the previous .text().html() form could not safely build data-name="...";
@@ -701,7 +729,7 @@ var gridOptions = {
                        '><i class="fa-regular fa-trash-can"></i></button>';
             }
             var gamesDisabled = !IS_ADMIN || row.on_games || row.local;
-            return '<button class="cmd-btn js-approve" title="Approve" data-name="' + esc(row.name) + '"' +
+            return '<button class="cmd-btn js-approve" title="Add to Whitelist" data-name="' + esc(row.name) + '"' +
                    (IS_ADMIN && !row.approved ? '' : ' disabled') +
                    '><i class="fa-solid fa-check-to-slot"></i></button>' +
                    '<button class="cmd-btn js-games" title="Add to Games" data-name="' + esc(row.name) + '"' +
@@ -752,7 +780,21 @@ var gridOptions = {
                 if (row.games_by && row.games_by !== row.name) {
                     g = 'Games via ' + row.games_by;
                 }
-                return '<i class="fa-solid fa-gamepad status-games" title="' + esc(g) + '"></i>';
+                /* The gamepad says which list covers the name. The second icon
+                 * says what happened for this client: allowed lookups, or
+                 * refusals. When a row has both, the later timestamp wins. */
+                var denied = parseInt(row.count, 10) || 0;
+                var allowed = parseInt(row.allowed_count, 10) || 0;
+                var allowedLater = row.allowed_last_seen &&
+                    (!row.last_seen || String(row.allowed_last_seen) > String(row.last_seen));
+                var wasAllowed = allowed > 0 && (denied === 0 || allowedLater);
+                var outcome = '';
+                if (wasAllowed) {
+                    outcome = '<i class="fa-solid fa-circle-check status-approved" title="Allowed"></i>';
+                } else if (denied > 0) {
+                    outcome = '<i class="fa-solid fa-circle-minus status-unapproved" title="Blocked"></i>';
+                }
+                return '<i class="fa-solid fa-gamepad status-games" title="' + esc(g) + '"></i>' + outcome;
             }
             return '<i class="fa-solid fa-circle-minus status-unapproved" title="Unapproved"></i>';
         },
@@ -1120,11 +1162,114 @@ function toggleAutoRefresh() {
 function openEdit(name) {
     if (!IS_ADMIN) return;
     editOriginal = name || '';
-    $('#editTitle').text(editOriginal ? 'Edit Domain' : 'Add Domain');
+    editParsedHost = '';
+    var adding = !editOriginal;
+    var listTitle = PAGE === 'games' ? 'Games' : 'Whitelist';
+    $('#editTitle').text(adding ? ('Add to ' + listTitle) : 'Edit Domain');
+    $('#editSaveBtn').text(adding ? ('Add to ' + listTitle) : 'Save');
+    $('#editNameLabel').text(adding ? 'Domain or URL' : 'Domain name');
+    $('#editName').attr('placeholder', adding ? 'https://example.com/path?q=1' : 'example.com');
+    $('#editHelp').text(adding
+        ? 'Paste a domain or a full URL. A URL can be saved as its exact host, its base domain, or a name you type.'
+        : 'Matches the domain and every subdomain of it. Must have at least two labels, using letters, digits, hyphen or underscore.');
     $('#editName').val(editOriginal);
     $('#editError').hide().text('');
-    $('#deleteBtn').toggle(!!editOriginal);
+    $('#editScope').hide();
+    $('input[name="editScope"][value="exact"]').prop('checked', true);
+    $('#editCustomText').val('').prop('disabled', true);
+    $('#editModal .modal-dialog').toggleClass('modal-sm', !adding);
+    $('#deleteBtn').toggle(!adding);
     $('#editModal').modal('show');
+}
+
+/* A pasted URL carries a scheme, a path, a query, or a hash. A bare domain
+ * does not, and is saved as typed. */
+function looksLikeUrl(text) {
+    var t = $.trim(text || '');
+    if (!t) return false;
+    if (t.indexOf('://') !== -1 || t.indexOf('//') === 0) return true;
+    return /[\/?#]/.test(t);
+}
+
+/* Hostname from a URL, or an error string when the text is URL-shaped but has
+ * nothing the lists can store. Null means the text is not a URL. */
+function hostFromInput(text) {
+    var t = $.trim(text || '');
+    if (!looksLikeUrl(t)) return null;
+    var toParse = t;
+    if (t.indexOf('://') === -1) {
+        toParse = 'https://' + t.replace(/^\/\//, '');
+    }
+    var url;
+    try {
+        url = new URL(toParse);
+    } catch (e) {
+        return { error: 'That does not look like a URL.' };
+    }
+    var host = String(url.hostname || '').toLowerCase().replace(/\.$/, '');
+    if (!host) return { error: 'That URL has no hostname.' };
+    /* URL.hostname leaves IPv6 unbracketed, so a colon means an address. */
+    if (host.indexOf(':') !== -1 || /^[0-9.]+$/.test(host)) {
+        return { error: 'That address has no domain to add.' };
+    }
+    if (host.indexOf('.') === -1) {
+        return { error: 'That name needs at least two labels, such as example.com.' };
+    }
+    return { host: host };
+}
+
+function refreshEditScope() {
+    if (editOriginal) {
+        $('#editScope').hide();
+        return;
+    }
+    var raw = $('#editName').val();
+    if (!looksLikeUrl(raw)) {
+        $('#editScope').hide();
+        $('#editError').hide().text('');
+        editParsedHost = '';
+        return;
+    }
+    var parsed = hostFromInput(raw);
+    if (!parsed || parsed.error) {
+        $('#editScope').hide();
+        $('#editError').text(parsed && parsed.error ? parsed.error : 'That URL has no hostname.').show();
+        editParsedHost = '';
+        return;
+    }
+    $('#editError').hide().text('');
+    var host = parsed.host;
+    var base = baseDomain(host);
+    $('#editExactText').text(host);
+    $('#editBaseText').text(base);
+    $('#editBaseRow').toggle(!!base && base !== host);
+    var $custom = $('#editCustomText');
+    if ($custom.prop('disabled') || $custom.val() === editParsedHost || !$custom.val()) {
+        $custom.val(host);
+    }
+    editParsedHost = host;
+    if (base === host && $('input[name="editScope"]:checked').val() === 'base') {
+        $('input[name="editScope"][value="exact"]').prop('checked', true);
+    }
+    $custom.prop('disabled', $('input[name="editScope"]:checked').val() !== 'custom');
+    $('#editScope').show();
+}
+
+/* The name that will be saved. A URL contributes the selected host, not the
+ * raw text. A custom value that is itself a URL contributes its host. */
+function chosenEditName() {
+    var raw = $.trim($('#editName').val());
+    if (editOriginal || !looksLikeUrl(raw) || !$('#editScope').is(':visible')) {
+        return raw;
+    }
+    var scope = $('input[name="editScope"]:checked').val();
+    if (scope === 'base') return $.trim($('#editBaseText').text());
+    if (scope === 'custom') {
+        var custom = $.trim($('#editCustomText').val());
+        var parsed = hostFromInput(custom);
+        return parsed && parsed.host ? parsed.host : custom;
+    }
+    return $.trim($('#editExactText').text());
 }
 
 function apiPost(action, data, onOk, onErr) {
@@ -1154,8 +1299,12 @@ function listNoun() {
 }
 
 function saveEntry() {
-    var name = $.trim($('#editName').val());
+    var name = chosenEditName();
     if (!name) { $('#editError').text('Please enter a domain name.').show(); return; }
+    if (looksLikeUrl(name)) {
+        $('#editError').text('Enter a domain, not a full URL.').show();
+        return;
+    }
     apiPost(listApi('save'), { original: editOriginal, name: name }, function (res) {
         $('#editModal').modal('hide');
         notify('Saved ' + res.name + (res.note ? ' \u2014 ' + res.note : ''), 'success');
@@ -1209,7 +1358,21 @@ $(function () {
 
     /* Enter = Save. Esc = Cancel is already handled by Bootstrap's own
        keyboard dismissal, which fires the same hidden.bs.modal path. */
+    $('#editName').on('input', function () {
+        if (!editOriginal) refreshEditScope();
+    });
     $('#editName').on('keydown', function (e) {
+        if (e.which === 13) {
+            e.preventDefault();
+            saveEntry();
+        }
+    });
+    $('input[name="editScope"]').on('change', function () {
+        var custom = $('input[name="editScope"]:checked').val() === 'custom';
+        $('#editCustomText').prop('disabled', !custom);
+        if (custom) $('#editCustomText').focus().select();
+    });
+    $('#editCustomText').on('keydown', function (e) {
         if (e.which === 13) {
             e.preventDefault();
             saveEntry();
@@ -1320,19 +1483,23 @@ function openDetail(row, dest) {
     $note.hide().empty();
     $scope.hide();
     detailTarget = null;
-    $('.scope-verb').text('Allow');
+    $('.scope-verb').text('Add');
+    $('#detailTitle').text('Domain');
 
     if (dest === 'games') {
         if (row.local) {
+            $('#detailTitle').text('Add to Games');
             $('#detailStatus').html('<i class="fa-solid fa-circle-check status-approved"></i>' +
                 'Currently <strong>allowed</strong> as a local network name.');
             $note.html('Single-label names are always allowed and are not added to the games list.').show();
         } else if (row.on_games) {
+            $('#detailTitle').text('Add to Games');
             var gvia = row.games_by && row.games_by !== row.name;
             $('#detailStatus').html('<i class="fa-solid fa-gamepad status-games"></i>' +
                 'Already on the <strong>games list</strong>' +
                 (gvia ? ' via <code>' + esc(row.games_by) + '</code>' : '') + '.');
         } else {
+            $('#detailTitle').text('Add to Games');
             if (row.on_whitelist) {
                 var wvia = row.covered_by && row.covered_by !== row.name;
                 $('#detailStatus').html('<i class="fa-solid fa-circle-check status-approved"></i>' +
@@ -1351,11 +1518,13 @@ function openDetail(row, dest) {
     } else if (row.local) {
         /* Allowed as a class by the resolver, so there is no whitelist row to
            remove and the action button would have nothing to act on. */
+        $('#detailTitle').text('Add to Whitelist');
         $('#detailStatus').html('<i class="fa-solid fa-circle-check status-approved"></i>' +
             'Currently <strong>allowed</strong> as a local network name.');
         $note.html('Single-label names are always allowed and have no whitelist ' +
                    'entry to remove.').show();
     } else if (row.on_whitelist) {
+        $('#detailTitle').text('Remove from Whitelist');
         var via = row.covered_by && row.covered_by !== row.name;
         $('#detailStatus').html('<i class="fa-solid fa-circle-check status-approved"></i>' +
             'Currently <strong>allowed</strong>' +
@@ -1374,6 +1543,7 @@ function openDetail(row, dest) {
         }
         if (blockNote) $note.html(blockNote).show();
     } else {
+        $('#detailTitle').text('Add to Whitelist');
         if (row.on_games) {
             var viaGames = row.games_by && row.games_by !== row.name;
             $('#detailStatus').html('<i class="fa-solid fa-gamepad status-games"></i>' +
@@ -1384,9 +1554,9 @@ function openDetail(row, dest) {
             $('#detailStatus').html('<i class="fa-solid fa-circle-minus status-unapproved"></i>' +
                 'Currently <strong>blocked</strong>.');
         }
-        showAllowScope(row, 'Allow');
+        showAllowScope(row, 'Add');
         detailTarget = { op: 'allow', name: row.name };
-        $act.text('Allow').removeClass('btn-danger').addClass('btn-success');
+        $act.text('Add to Whitelist').removeClass('btn-danger').addClass('btn-success');
     }
 
     $act.toggle(!!detailTarget && IS_ADMIN);
@@ -1400,7 +1570,9 @@ function applyDetailAction() {
         ? selectedScopeName(detailTarget.name) : detailTarget.name;
 
     if (!name) {
-        notify('Enter a domain to allow.', 'danger');
+        notify(op === 'games'
+            ? 'Enter a domain to add to the games list.'
+            : 'Enter a domain to add to the whitelist.', 'danger');
         return;
     }
 
@@ -1409,7 +1581,7 @@ function applyDetailAction() {
 
     if (op === 'allow') {
         apiPost('history_approve', { name: name }, function (res) {
-            notify('Allowed ' + res.name + (res.note ? ' \u2014 ' + res.note : ''), 'success');
+            notify('Added ' + res.name + ' to the whitelist' + (res.note ? ' \u2014 ' + res.note : ''), 'success');
             grid.bootgrid('reload');
         });
     } else if (op === 'games') {
